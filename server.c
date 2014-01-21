@@ -13,6 +13,7 @@
 #include <time.h>
 #include <signal.h>
 #include <limits.h>
+#include <pwd.h>
 
 #define MAXCLIENTS       128
 #define STATUS_REQ         0
@@ -23,7 +24,7 @@
 #endif
 
 #define REQUEST_MAX_SIZE  2047
-#define WR_BLOCK_SIZE	 1024
+#define WR_BLOCK_SIZE	 (1024*1024)  // 1MB
 
 #define MAX_PATH_LEN	  2048
 #define DEFAULT_DOC	"index.htm"
@@ -34,6 +35,9 @@ const unsigned char * crlf = &crlf_crlf[2];
 const unsigned char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 const unsigned char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
 const unsigned char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
+
+// Temporary buffer for main thread usage
+char tbuffer[WR_BLOCK_SIZE];
 
 struct mime_type {
 	char extension[6];
@@ -244,18 +248,6 @@ void server_run (int port, int ctimeout, char * base_path) {
 	int num_active_clients = 0;
 	int i,j,k;
 
-	struct sockaddr_in servaddr;
-
-	listenfd = socket(AF_INET, SOCK_STREAM, 0);
-	memset(&servaddr, 0, sizeof(servaddr));
-	servaddr.sin_family = AF_INET;
-	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-	servaddr.sin_port   = htons(port);
-	int yes = 1;
-	setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
-	if (bind(listenfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0) {
-		printf("Error binding the port.\n",errno); perror("bind"); exit(1);
-	}
 	/* Force the network socket into nonblocking mode */
 	if (setNonblocking(listenfd) < 0) {
 		printf("Error  while trying to go NON-BLOCKING\n"); exit(1);
@@ -381,7 +373,6 @@ void server_run (int port, int ctimeout, char * base_path) {
 						if (tasks[i].fdfile == 0) {  // No file!
 							force_end = 1;
 						}else{
-							char tbuffer[WR_BLOCK_SIZE];
 							int toread = WR_BLOCK_SIZE;
 							if (toread > (tasks[i].fend + 1 - ftello(tasks[i].fdfile))) toread = (tasks[i].fend + 1 - ftello(tasks[i].fdfile));
 
@@ -446,6 +437,8 @@ int main (int argc, char ** argv) {
 	int timeout = 8;
 	unsigned char base_path[MAX_PATH_LEN] = {0};
 	getcwd(base_path,MAX_PATH_LEN-1);
+	char sw_user [256];
+	strcpy(sw_user,"nobody");
 
 	int i;
 	for (i = 1; i < argc; i++) {
@@ -461,16 +454,45 @@ int main (int argc, char ** argv) {
 		if (strcmp(argv[i],"-d") == 0) {
 			strcpy(base_path,argv[i+1]);
 		}
+		// User drop
+		if (strcmp(argv[i],"-u") == 0) {
+			strcpy(sw_user, argv[i+1]);
+		}
 		// Help
 		if (strcmp(argv[i],"-h") == 0) {
-			printf("Usage: server [-p port] [-t timeout] [-d base_dir]\n \
-			Default port is 80\n\
-			Default timeout is 8 seconds of network inactivity\n\
-			Default dir is working dir\n");
+			printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
+			"    -p     Port             (Default port is 80)\n"
+			"    -t     Timeout          (Default timeout is 8 seconds of network inactivity)\n"
+			"    -d     Base Dir         (Default dir is working dir)\n"
+			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody)\n"
+			);
 			exit(0);
 		}
 	}
+	
+	// Bind port!
+	struct sockaddr_in servaddr;
 
+	listenfd = socket(AF_INET, SOCK_STREAM, 0);
+	memset(&servaddr, 0, sizeof(servaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	servaddr.sin_port   = htons(port);
+	int yes = 1;
+	setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
+	if (bind(listenfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0) {
+		printf("Error binding the port.\n",errno); perror("bind"); exit(1);
+	}
+
+	// Switch to user
+	struct passwd * pw = getpwnam(sw_user);
+	if (pw == 0) {
+		fprintf(stderr,"Could not find user %s\n",sw_user);
+		exit(1);
+	}
+	setgid(pw->pw_gid);
+	setuid(pw->pw_uid);
+	
 	server_run(port, timeout, base_path);
 }
 

@@ -192,26 +192,58 @@ void strcpy_o(char * dest, char * src) {
 	*dest = 0;
 }
 
+
 void path_create(char * base_path, char * req_file, char * out_file) {
+	char temp[ strlen(req_file)+1 ];
+	strcpy(temp, req_file);
+	
+	int i,j;
+	// Remove double slashes
+	for (i = 0; i < strlen(temp)-1; i++) {
+		if (temp[i] == '/' && temp[i+1] == '/') {
+			strcpy_o(&temp[i+1], &temp[i]);
+			i--;
+		}
+	}
+	// Remove .. by removing previous dir
+	for (i = 0; i < (int)strlen(temp)-4; i++) {
+		if (temp[i] == '/' && temp[i+1] == '.' && 
+			temp[i+2] == '.' && temp[i+3] == '/') {
+			
+			// Remove previous folder
+			for (j = i-1; j >= 0; j--) {
+				if (temp[j] == '/' || j == 0) {
+					strcpy_o(&temp[j], &temp[i+3]);
+					i = -1;
+					break;
+				}
+			}
+		}
+	}
+	// Remove the remaining .. (prevent going up base_dir)
+	for (i = 0; i < (int)strlen(temp)-4; i++) {
+		if (temp[i] == '/' && temp[i+1] == '.' && 
+			temp[i+2] == '.' && temp[i+3] == '/') {
+			
+			// Remove previous folder
+			strcpy_o(&temp[i],&temp[i+3]);
+			i--;
+		}
+	}
+	
+	if (temp[0] == '/')
+		strcpy_o(&temp[0],&temp[1]);
+
 	out_file[0] = 0;
 	strcpy(out_file,base_path);
 	strcat(out_file,"/");
-	strcat(out_file,req_file);
-
-	char * pos;
-	// Remove ".."
-	while ((pos = strstr(out_file,"..")) != 0) {
-		strcpy_o(pos,pos+2);
-	}
-	// Remove "//"
-	while ((pos = strstr(out_file,"//")) != 0) {
-		strcpy_o(pos,pos+1);
-	}
+	strcat(out_file,temp);
 
 	// If it ends as "/" it's a path, so append default file
 	if (out_file[strlen(out_file)-1] == '/')
 		strcat(out_file,DEFAULT_DOC);
 }
+
 
 void process_exit(int signal) {
 	// Close all the connections and files
@@ -327,7 +359,7 @@ void server_run (int port, int ctimeout, char * base_path) {
 							}
 							
 							header_attr_lookup(tasks[i].request_data,"GET "," "); // Get the file
-							char file_path[MAX_PATH_LEN];
+							char file_path[MAX_PATH_LEN*2];
 							path_create(base_path,param_str,file_path);
 
 							FILE * fd = fopen(file_path,"rb");

@@ -29,6 +29,8 @@
 #define MAX_PATH_LEN	  2048
 #define DEFAULT_DOC	"index.htm"
 
+void urldecode (char * dest, const char *url);
+
 const unsigned char crlf_crlf[5] = {0xD,0xA,0xD,0xA,0x0};
 const unsigned char * crlf = &crlf_crlf[2];
 
@@ -234,11 +236,11 @@ void path_create(char * base_path, char * req_file, char * out_file) {
 	if (temp[0] == '/')
 		strcpy_o(&temp[0],&temp[1]);
 
-	out_file[0] = 0;
 	strcpy(out_file,base_path);
 	strcat(out_file,"/");
-	strcat(out_file,temp);
-
+	
+	urldecode(&out_file[strlen(out_file)], temp);
+	
 	// If it ends as "/" it's a path, so append default file
 	if (out_file[strlen(out_file)-1] == '/')
 		strcat(out_file,DEFAULT_DOC);
@@ -526,6 +528,56 @@ int main (int argc, char ** argv) {
 	setuid(pw->pw_uid);
 	
 	server_run(port, timeout, base_path);
+}
+
+char hex2char(const char * i) {
+	char c1, c2;
+	if      (i[0] >= '0' && i[0] <= '9') c1 = i[0]-'0';
+	else if (i[0] >= 'a' && i[0] <= 'f') c1 = i[0]-'a'+10;
+	else                                 c1 = i[0]-'A'+10;
+		
+	if      (i[1] >= '0' && i[1] <= '9') c2 = i[1]-'0';
+	else if (i[1] >= 'a' && i[1] <= 'f') c2 = i[1]-'a'+10;
+	else                                 c2 = i[1]-'A'+10;
+	
+	return c1*16+c2;
+}
+int ishexpair(const char * i) {
+	if (!(	(i[0] >= '0' && i[0] <= '9') ||
+		(i[0] >= 'a' && i[0] <= 'f') ||
+		(i[0] >= 'A' && i[0] <= 'F') ))
+		return 0;
+	if (!(	(i[1] >= '0' && i[1] <= '9') ||
+		(i[1] >= 'a' && i[1] <= 'f') ||
+		(i[1] >= 'A' && i[1] <= 'F') ))
+		return 0;
+	return 1;
+}
+
+void urldecode (char * dest, const char *url) {
+	int s = 0, d = 0;
+	int url_len = strlen (url) + 1;
+
+	while (s < url_len) {
+		char c = url[s++];
+
+		if (c == '%' && s + 2 < url_len) {
+			if (ishexpair(&url[s]))
+				dest[d++] = hex2char(&url[s]);
+			else {
+				dest[d++] = c;
+				dest[d++] = url[s+0];
+				dest[d++] = url[s+1];
+			}
+			s += 2;
+		}
+		else if (c == '+') {
+			dest[d++] = ' ';
+		}
+		else {
+			dest[d++] = c;
+		}
+	}
 }
 
 

@@ -15,21 +15,11 @@
 #include <limits.h>
 #include <pwd.h>
 
-#define MAXCLIENTS       128
-#define STATUS_REQ         0
+#include "server_config.h"
+#include "server.h"
+
+#define STATUS_REQ         0               
 #define STATUS_RESP        1
-
-#ifndef LLONG_MAX
-	#define LLONG_MAX 2094967295
-#endif
-
-#define REQUEST_MAX_SIZE  2047
-#define WR_BLOCK_SIZE	 (1024*1024)  // 1MB
-
-#define MAX_PATH_LEN	  2048
-#define DEFAULT_DOC	"index.htm"
-
-void urldecode (char * dest, const char *url);
 
 const unsigned char crlf_crlf[5] = {0xD,0xA,0xD,0xA,0x0};
 const unsigned char * crlf = &crlf_crlf[2];
@@ -89,77 +79,6 @@ int setNonblocking(int fd) {
 #endif
 }
 
-// writes to param_str the value of the parameter in the request trimming whitespaces
-char param_str[REQUEST_MAX_SIZE*3];
-int header_attr_lookup(const char * request, const char * param, const char * param_end) {
-	char * ptr = strstr(request,param);  // ptr to the parameter line
-	if (ptr == 0)
-		return -1;
-	ptr += strlen(param);  // ptr now points to the start of the data
-	while (*ptr == ' ') ptr++;  // trim whitespaces
-
-	char * ptr2 = strstr(ptr,param_end);   // ptr to the end of the line
-	if (ptr2 == 0)
-		return -1;
-
-	int len = (((size_t)ptr2) - ((size_t)ptr));
-	if (len < 0) return -1;
-	memcpy(param_str, ptr, len);  // Copy the data to the buffer
-	param_str[len] = 0;
-
-	return len;  // Returns the size of the parameter
-}
-
-int parse_range_req(char * req_val, long long * start, long long * end) {
-	// Req_val will be something like:
-	// bytes=120-   (download from byte 120 to the end)
-	// bytes=-120   (download the last 120 bytes)
-	// bytes=120-123 (interval)
-	// bytes=1-2,5-6 (multiple chunks)
-	// We only support %- or %-%
-
-	// Check if there's a comma!
-	if (strstr(req_val,",") != 0)
-		return -1;
-
-	// Strip bytes prefix
-	char * ptr = strstr(req_val,"=");
-	if (ptr == 0) ptr = req_val;
-	else ptr++; //Skip "="
-
-	// Whitespace strip
-	while (*ptr == ' ') ptr++;
-
-	if (*ptr == 0) return -1; // Empty!!!
-
-	// Read the start
-	sscanf(ptr,"%lld %*s",start);
-	
-	// Search for "-" 
-	ptr = strstr(ptr,"-");
-	if (ptr == 0) {
-		// Assume no end then... use Maximum Signed long long (2^63-1) on all platforms
-		*end = LLONG_MAX;
-		return 0;
-	}
-	else
-		ptr++;
-
-	// More whitespace
-	while (*ptr == ' ') ptr++;
-
-	if (*ptr == 0) {
-		// Assume no end then... use Maximum Signed long long (2^63-1) on all platforms
-		*end = LLONG_MAX;	
-		return 0;	
-	}
-
-	// Read the end
-	sscanf(ptr,"%lld %*s",end);
-
-	return 0;
-}
-
 char * mime_lookup(char * file) {
 	char * extension = &file[strlen(file)-1];
 	while (*extension != '.') {
@@ -184,66 +103,6 @@ long long lof(FILE * fd) {
 	long long len = ftello(fd);
 	fseeko(fd,pos,SEEK_SET);
 	return len;
-}
-
-// strcpy with overlap buffers
-void strcpy_o(char * dest, char * src) {
-	while (*src != 0) {
-		*dest++ = *src++;
-	}
-	*dest = 0;
-}
-
-
-void path_create(char * base_path, char * req_file, char * out_file) {
-	char temp[ strlen(req_file)+1 ];
-	strcpy(temp, req_file);
-	
-	int i,j;
-	// Remove double slashes
-	for (i = 0; i < strlen(temp)-1; i++) {
-		if (temp[i] == '/' && temp[i+1] == '/') {
-			strcpy_o(&temp[i+1], &temp[i]);
-			i--;
-		}
-	}
-	// Remove .. by removing previous dir
-	for (i = 0; i < (int)strlen(temp)-4; i++) {
-		if (temp[i] == '/' && temp[i+1] == '.' && 
-			temp[i+2] == '.' && temp[i+3] == '/') {
-			
-			// Remove previous folder
-			for (j = i-1; j >= 0; j--) {
-				if (temp[j] == '/' || j == 0) {
-					strcpy_o(&temp[j], &temp[i+3]);
-					i = -1;
-					break;
-				}
-			}
-		}
-	}
-	// Remove the remaining .. (prevent going up base_dir)
-	for (i = 0; i < (int)strlen(temp)-4; i++) {
-		if (temp[i] == '/' && temp[i+1] == '.' && 
-			temp[i+2] == '.' && temp[i+3] == '/') {
-			
-			// Remove previous folder
-			strcpy_o(&temp[i],&temp[i+3]);
-			i--;
-		}
-	}
-	
-	if (temp[0] == '/')
-		strcpy_o(&temp[0],&temp[1]);
-
-	strcpy(out_file,base_path);
-	strcat(out_file,"/");
-	
-	urldecode(&out_file[strlen(out_file)], temp);
-	
-	// If it ends as "/" it's a path, so append default file
-	if (out_file[strlen(out_file)-1] == '/')
-		strcat(out_file,DEFAULT_DOC);
 }
 
 
@@ -409,6 +268,7 @@ void server_run (int port, int ctimeout, char * base_path) {
 						}else{
 							int toread = WR_BLOCK_SIZE;
 							if (toread > (tasks[i].fend + 1 - ftello(tasks[i].fdfile))) toread = (tasks[i].fend + 1 - ftello(tasks[i].fdfile));
+							if (toread < 0) toread = 0; // File could change its size...
 
 							int numb = fread(tbuffer,1,toread,tasks[i].fdfile);
 							if (numb == 0 || toread == 0) {
@@ -528,56 +388,6 @@ int main (int argc, char ** argv) {
 	setuid(pw->pw_uid);
 	
 	server_run(port, timeout, base_path);
-}
-
-char hex2char(const char * i) {
-	char c1, c2;
-	if      (i[0] >= '0' && i[0] <= '9') c1 = i[0]-'0';
-	else if (i[0] >= 'a' && i[0] <= 'f') c1 = i[0]-'a'+10;
-	else                                 c1 = i[0]-'A'+10;
-		
-	if      (i[1] >= '0' && i[1] <= '9') c2 = i[1]-'0';
-	else if (i[1] >= 'a' && i[1] <= 'f') c2 = i[1]-'a'+10;
-	else                                 c2 = i[1]-'A'+10;
-	
-	return c1*16+c2;
-}
-int ishexpair(const char * i) {
-	if (!(	(i[0] >= '0' && i[0] <= '9') ||
-		(i[0] >= 'a' && i[0] <= 'f') ||
-		(i[0] >= 'A' && i[0] <= 'F') ))
-		return 0;
-	if (!(	(i[1] >= '0' && i[1] <= '9') ||
-		(i[1] >= 'a' && i[1] <= 'f') ||
-		(i[1] >= 'A' && i[1] <= 'F') ))
-		return 0;
-	return 1;
-}
-
-void urldecode (char * dest, const char *url) {
-	int s = 0, d = 0;
-	int url_len = strlen (url) + 1;
-
-	while (s < url_len) {
-		char c = url[s++];
-
-		if (c == '%' && s + 2 < url_len) {
-			if (ishexpair(&url[s]))
-				dest[d++] = hex2char(&url[s]);
-			else {
-				dest[d++] = c;
-				dest[d++] = url[s+0];
-				dest[d++] = url[s+1];
-			}
-			s += 2;
-		}
-		else if (c == '+') {
-			dest[d++] = ' ';
-		}
-		else {
-			dest[d++] = c;
-		}
-	}
 }
 
 

@@ -4,5 +4,9 @@ all:
 	strip -s server
 
 clean:
-	rm -f server
+	rm -f server regression
+
+.PHONY:	regression
+regression:
+	gcc -O0 -o regression tests/regression.c -I . -ggdb
 

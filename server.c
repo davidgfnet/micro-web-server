@@ -26,10 +26,13 @@ const unsigned char * crlf = &crlf_crlf[2];
 
 const unsigned char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 const unsigned char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+const unsigned char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
 const unsigned char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 
 // Temporary buffer for main thread usage
 char tbuffer[WR_BLOCK_SIZE];
+
+char auth_str[128]; // "Basic dXNlcjpwYXNz";
 
 struct mime_type {
 	char extension[6];
@@ -218,30 +221,46 @@ void server_run (int port, int ctimeout, char * base_path) {
 									tasks[i].fend = LLONG_MAX;
 								}
 							}
-							
-							header_attr_lookup(tasks[i].request_data,"GET "," "); // Get the file
-							char file_path[MAX_PATH_LEN*2];
-							path_create(base_path,param_str,file_path);
 
-							FILE * fd = fopen(file_path,"rb");
-							if (fd == NULL) {
-								// Not found! 404 here
-								strcpy(tasks[i].request_data,err_404);
-								tasks[i].request_size = strlen(err_404);
-							}else{
-								long long len = lof(fd);
-								char * mimetype = mime_lookup(file_path);
-								if (tasks[i].fend > len-1) tasks[i].fend = len-1;  // Last byte, not size
-
-								if (userange) {
-									sprintf(tasks[i].request_data,partial_206,fstart,tasks[i].fend,len,len,mimetype);
-									tasks[i].request_size = strlen(tasks[i].request_data);
-								}else{
-									sprintf(tasks[i].request_data,ok_200,len,mimetype);
-									tasks[i].request_size = strlen(tasks[i].request_data);
+							// Auth
+							int auth_ok = 1;
+							if (auth_str[0] != 0) {
+								if (header_attr_lookup(tasks[i].request_data,"Authorization:",crlf) >= 0) {
+									if (strcmp(param_str, auth_str) != 0)
+										auth_ok = 0;
 								}
-								tasks[i].fdfile = fd;
-								fseeko(fd,fstart,SEEK_SET); // Seek the first byte
+								else auth_ok = 0;
+							}
+							
+							if (auth_ok) {
+								header_attr_lookup(tasks[i].request_data,"GET "," "); // Get the file
+								char file_path[MAX_PATH_LEN*2];
+								path_create(base_path,param_str,file_path);
+
+								FILE * fd = fopen(file_path,"rb");
+								if (fd == NULL) {
+									// Not found! 404 here
+									strcpy(tasks[i].request_data,err_404);
+									tasks[i].request_size = strlen(err_404);
+								}else{
+									long long len = lof(fd);
+									char * mimetype = mime_lookup(file_path);
+									if (tasks[i].fend > len-1) tasks[i].fend = len-1;  // Last byte, not size
+
+									if (userange) {
+										sprintf(tasks[i].request_data,partial_206,fstart,tasks[i].fend,len,len,mimetype);
+										tasks[i].request_size = strlen(tasks[i].request_data);
+									}else{
+										sprintf(tasks[i].request_data,ok_200,len,mimetype);
+										tasks[i].request_size = strlen(tasks[i].request_data);
+									}
+									tasks[i].fdfile = fd;
+									fseeko(fd,fstart,SEEK_SET); // Seek the first byte
+								}
+							}
+							else {
+								strcpy(tasks[i].request_data,err_401);
+								tasks[i].request_size = strlen(err_401);
 							}
 							tasks[i].offset = 0;
 						}
@@ -355,13 +374,18 @@ int main (int argc, char ** argv) {
 		if (strcmp(argv[i],"-u") == 0) {
 			strcpy(sw_user, argv[i+1]);
 		}
+		// Auth
+		if (strcmp(argv[i],"-a") == 0) {
+			strcpy(auth_str, argv[i+1]);
+		}
 		// Help
 		if (strcmp(argv[i],"-h") == 0) {
 			printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
 			"    -p     Port             (Default port is 80)\n"
 			"    -t     Timeout          (Default timeout is 8 seconds of network inactivity)\n"
 			"    -d     Base Dir         (Default dir is working dir)\n"
-			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody)\n"
+			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody))\n"
+			"    -a     HTTP Auth        (Specify an auth string, i.e. \"Basic dXNlcjpwYXNz\")\n"
 			);
 			exit(0);
 		}

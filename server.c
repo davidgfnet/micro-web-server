@@ -279,8 +279,11 @@ void server_run (int port, int ctimeout, char * base_path) {
 								// Try to write the data to the socket
 								int bwritten = write(tasks[i].fd,tbuffer,numb);
 
+								// Seek back if necessary
+								int bw = bwritten >= 0 ? bwritten : 0;
+								fseek(tasks[i].fdfile,-numb+bw,SEEK_CUR);
+
 								if (bwritten >= 0) {
-									fseek(tasks[i].fdfile,-numb+bwritten,SEEK_CUR);
 									time(&tasks[i].start_time);   // Update timeout
 								}
 								else if (errno != EAGAIN && errno != EWOULDBLOCK)

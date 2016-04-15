@@ -246,12 +246,13 @@ void server_run (int port, int ctimeout, char * base_path) {
 									long long len = lof(fd);
 									char * mimetype = mime_lookup(file_path);
 									if (tasks[i].fend > len-1) tasks[i].fend = len-1;  // Last byte, not size
+									long long content_length = tasks[i].fend - fstart + 1;
 
 									if (userange) {
-										sprintf(tasks[i].request_data,partial_206,fstart,tasks[i].fend,len,len,mimetype);
+										sprintf(tasks[i].request_data,partial_206,fstart,tasks[i].fend,len,content_length,mimetype);
 										tasks[i].request_size = strlen(tasks[i].request_data);
 									}else{
-										sprintf(tasks[i].request_data,ok_200,len,mimetype);
+										sprintf(tasks[i].request_data,ok_200,content_length,mimetype);
 										tasks[i].request_size = strlen(tasks[i].request_data);
 									}
 									tasks[i].fdfile = fd;

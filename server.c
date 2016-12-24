@@ -13,6 +13,8 @@
 #include <time.h>
 #include <signal.h>
 #include <limits.h>
+#include <dirent.h>
+#include <unistd.h>
 #include <pwd.h>
 
 #include "server_config.h"
@@ -28,6 +30,9 @@ const unsigned char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nCont
 const unsigned char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
 const unsigned char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
 const unsigned char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
+
+const unsigned char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
+const unsigned char dirlist_200_html[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
 
 // Temporary buffer for main thread usage
 char tbuffer[WR_BLOCK_SIZE];
@@ -61,6 +66,7 @@ struct process_task {
 	long long fend;
 	unsigned short request_size;
 	unsigned char request_data[REQUEST_MAX_SIZE+1];
+	DIR *dirlist;
 };
 int listenfd;
 struct process_task tasks[MAXCLIENTS];
@@ -134,8 +140,7 @@ int fdtable_lookup(int fd) {
 	return 0;
 }
 
-
-void server_run (int port, int ctimeout, char * base_path) {
+void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 	signal (SIGTERM, process_exit);
 	signal (SIGHUP, process_exit);
 	signal (SIGINT, process_exit);
@@ -180,6 +185,7 @@ void server_run (int port, int ctimeout, char * base_path) {
 				tasks[j].request_size = 0;
 				tasks[j].status = STATUS_REQ;
 				tasks[j].fdfile = 0;
+				tasks[j].dirlist = 0;
 				tasks[j].end = 0;
 				time(&tasks[j].start_time);
 			}
@@ -235,14 +241,25 @@ void server_run (int port, int ctimeout, char * base_path) {
 							if (auth_ok) {
 								header_attr_lookup(tasks[i].request_data,"GET "," "); // Get the file
 								char file_path[MAX_PATH_LEN*2];
-								path_create(base_path,param_str,file_path);
+								int code = path_create(base_path, param_str, file_path, dirlist);
 
-								FILE * fd = fopen(file_path,"rb");
-								if (fd == NULL) {
+								switch (code) {
+								case RTYPE_404:
 									// Not found! 404 here
 									strcpy(tasks[i].request_data,err_404);
 									tasks[i].request_size = strlen(err_404);
-								}else{
+									break;
+								case RTYPE_DIR:  // Dir
+									tasks[i].dirlist = opendir(file_path);
+									#ifdef HTMLLIST
+										strcpy(tasks[i].request_data,dirlist_200_html);
+									#else
+										strcpy(tasks[i].request_data,dirlist_200_txt);
+									#endif
+									tasks[i].request_size = strlen(tasks[i].request_data);
+									break;
+								case RTYPE_FIL:{// File
+									FILE * fd = fopen(file_path,"rb");
 									long long len = lof(fd);
 									char * mimetype = mime_lookup(file_path);
 									if (tasks[i].fend > len-1) tasks[i].fend = len-1;  // Last byte, not size
@@ -257,7 +274,8 @@ void server_run (int port, int ctimeout, char * base_path) {
 									}
 									tasks[i].fdfile = fd;
 									fseeko(fd,fstart,SEEK_SET); // Seek the first byte
-								}
+									}break;
+								};
 							}
 							else {
 								strcpy(tasks[i].request_data,err_401);
@@ -272,20 +290,10 @@ void server_run (int port, int ctimeout, char * base_path) {
 				
 				// HTTP RESPONSE BODY WRITE
 				if (tasks[i].status == STATUS_RESP && force_end == 0) {
-					if (tasks[i].offset < tasks[i].request_size) {  // Header
-						int bwritten = write(tasks[i].fd,&tasks[i].request_data[tasks[i].offset],tasks[i].request_size-tasks[i].offset);
 
-						if (bwritten >= 0) {
-							tasks[i].offset += bwritten;
-							time(&tasks[i].start_time);   // Update timeout
-						}
-						else if (errno != EAGAIN && errno != EWOULDBLOCK)
-							force_end = 1;  // Some unknown error!
-					}else{ // Body
+					if (tasks[i].offset == tasks[i].request_size) { // Try to feed more data into the buffers
 						// Fetch some data from the file
-						if (tasks[i].fdfile == 0) {  // No file!
-							force_end = 1;
-						}else{
+						if (tasks[i].fdfile) {
 							int toread = WR_BLOCK_SIZE;
 							if (toread > (tasks[i].fend + 1 - ftello(tasks[i].fdfile))) toread = (tasks[i].fend + 1 - ftello(tasks[i].fdfile));
 							if (toread < 0) toread = 0; // File could change its size...
@@ -311,7 +319,35 @@ void server_run (int port, int ctimeout, char * base_path) {
 							}
 							else
 								force_end = 1;
+						} else if (tasks[i].dirlist) {
+							struct dirent *ep = readdir(tasks[i].dirlist);
+							if (ep) {
+								const char * slash = ep->d_type == DT_DIR ? "/" : "";
+								#ifdef HTMLLIST
+									sprintf(tasks[i].request_data, "<a href=\"%s%s\">%s%s</a><br>\n", ep->d_name, slash, ep->d_name, slash);
+								#else
+									sprintf(tasks[i].request_data, "%s%s\n", ep->d_name, slash);
+								#endif
+								tasks[i].offset = 0;
+								tasks[i].request_size = strlen(tasks[i].request_data);
+							} else {
+								closedir(tasks[i].dirlist);
+								force_end = 1;
+							}
+						} else {
+							force_end = 1;
 						}
+					}
+
+					if (tasks[i].offset < tasks[i].request_size) {  // Header
+						int bwritten = write(tasks[i].fd,&tasks[i].request_data[tasks[i].offset],tasks[i].request_size-tasks[i].offset);
+
+						if (bwritten >= 0) {
+							tasks[i].offset += bwritten;
+							time(&tasks[i].start_time);   // Update timeout
+						}
+						else if (errno != EAGAIN && errno != EWOULDBLOCK)
+							force_end = 1;  // Some unknown error!
 					}
 				}
 
@@ -352,6 +388,7 @@ void server_run (int port, int ctimeout, char * base_path) {
 int main (int argc, char ** argv) {
 	int port = 80;
 	int timeout = 8;
+	int dirlist = 0;
 	unsigned char base_path[MAX_PATH_LEN] = {0};
 	getcwd(base_path,MAX_PATH_LEN-1);
 	char sw_user [256];
@@ -371,6 +408,10 @@ int main (int argc, char ** argv) {
 		if (strcmp(argv[i],"-d") == 0) {
 			strcpy(base_path,argv[i+1]);
 		}
+		// Dir list
+		if (strcmp(argv[i],"-l") == 0) {
+			dirlist = 1;
+		}
 		// User drop
 		if (strcmp(argv[i],"-u") == 0) {
 			strcpy(sw_user, argv[i+1]);
@@ -385,6 +426,7 @@ int main (int argc, char ** argv) {
 			"    -p     Port             (Default port is 80)\n"
 			"    -t     Timeout          (Default timeout is 8 seconds of network inactivity)\n"
 			"    -d     Base Dir         (Default dir is working dir)\n"
+			"    -l     Enable dir lists (Off by default for security reasons)\n"
 			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody))\n"
 			"    -a     HTTP Auth        (Specify an auth string, i.e. \"Basic dXNlcjpwYXNz\")\n"
 			);
@@ -415,7 +457,7 @@ int main (int argc, char ** argv) {
 	setgid(pw->pw_gid);
 	setuid(pw->pw_uid);
 	
-	server_run(port, timeout, base_path);
+	server_run(port, timeout, base_path, dirlist);
 }
 
 

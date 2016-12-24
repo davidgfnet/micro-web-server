@@ -19,6 +19,10 @@
 	#define LLONG_MAX 2094967295
 #endif
 
+#define RTYPE_404    0
+#define RTYPE_DIR    1
+#define RTYPE_FIL    2
+
 void urldecode (char * dest, const char *url);
 
 // writes to param_str the value of the parameter in the request trimming whitespaces
@@ -102,7 +106,7 @@ void strcpy_o(char * dest, char * src) {
 	*dest = 0;
 }
 
-void path_create(const char * base_path, const char * req_file, char * out_file) {
+int path_create(const char * base_path, const char * req_file, char * out_file, int dirlist) {
 	char temp[ strlen(req_file)+1 ];
 	strcpy(temp, req_file);
 	
@@ -149,8 +153,39 @@ void path_create(const char * base_path, const char * req_file, char * out_file)
 	urldecode(&out_file[strlen(out_file)], temp);
 	
 	// If it ends as "/" it's a path, so append default file
-	if (out_file[strlen(out_file)-1] == '/')
-		strcat(out_file,DEFAULT_DOC);
+	// (Only if it exists ofc)
+	unsigned osize = strlen(out_file);
+	if (out_file[strlen(out_file)-1] == '/') {
+		strcat(out_file, DEFAULT_DOC);
+
+		// Try the index first
+		FILE * fd = fopen(out_file, "rb");
+		if (fd) {
+			fclose(fd);
+			return RTYPE_FIL;
+		}
+
+		// Strip the default doc and output the dir
+		out_file[osize] = 0;
+	}
+
+	// Try to open the dir
+	if (dirlist) {
+		void * ptr = opendir(out_file);
+		if (ptr) {
+			closedir(ptr);
+			return RTYPE_DIR;
+		}
+	}
+
+	// Try as file
+	FILE * fd = fopen(out_file, "rb");
+	if (fd) {
+		fclose(fd);
+		return RTYPE_FIL;
+	}
+
+	return RTYPE_404;
 }
 
 char hex2char(const char * i) {

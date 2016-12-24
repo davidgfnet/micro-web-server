@@ -6,3 +6,6 @@
 #define MAXCLIENTS       128             // Maximum number of simultaneous connections allowed (the bigger, the more mem used)
 #define WR_BLOCK_SIZE	 (1024*1024)     // Chunk size for disk read/write operations, the bigger the more throughput
 
+#define LISTDIRS                         // Enable directory listing
+#define HTMLLIST                         // Directory listing is an HTML doc (as opposted to TXT)
+

@@ -61,15 +61,21 @@ struct process_task {
 	int fd;
 	FILE* fdfile;
 	long start_time;
-	char status, end;
+	char status;
 	int offset;
 	long long fend;
 	unsigned short request_size;
 	unsigned char request_data[REQUEST_MAX_SIZE+1];
 	DIR *dirlist;
+
+	// List of free/nonfree tasks
+	struct process_task * next;
+	int id;
 };
 int listenfd;
 struct process_task tasks[MAXCLIENTS];
+struct process_task * free_task = &tasks[0];
+struct process_task * proc_task = NULL;
 struct pollfd fdtable[MAXCLIENTS+1];
 
 int setNonblocking(int fd) {
@@ -163,7 +169,11 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 		fdtable[i].events = POLLIN;  // By default
 		fdtable[i].revents = 0;
 	}
-	for (i = 0; i < MAXCLIENTS; i++) tasks[i].fd = -1;
+	for (i = 0; i < MAXCLIENTS; i++) {
+		tasks[i].fd = -1;
+		tasks[i].next = (i != MAXCLIENTS-1) ? &tasks[i+1] : 0;
+		tasks[i].id = i;
+	}
 	fdtable[0].fd = listenfd;
 
 	while(1) {
@@ -174,213 +184,229 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 			int fd = accept(listenfd, NULL, NULL);
 			if (fd != -1) {
 				setNonblocking(fd);
-				// Add the fd to the poll wait table!
-				int i = ++num_active_clients;
-				fdtable[i].fd = fd;
-				fdtable[i].events = POLLIN;  // By default we read (the request)
-				for (j = 0; j < MAXCLIENTS; j++)
-					if (tasks[j].fd < 0) break;
 
-				tasks[j].fd = fd;
-				tasks[j].request_size = 0;
-				tasks[j].status = STATUS_REQ;
-				tasks[j].fdfile = 0;
-				tasks[j].dirlist = 0;
-				tasks[j].end = 0;
-				time(&tasks[j].start_time);
+				if (free_task != 0) {
+					// Add the fd to the poll wait table!
+					int i = ++num_active_clients;
+					fdtable[i].fd = fd;
+					fdtable[i].events = POLLIN;  // By default we read (the request)
+
+					struct process_task * t = free_task;
+					t->fd = fd;
+					t->request_size = 0;
+					t->status = STATUS_REQ;
+					t->fdfile = 0;
+					t->dirlist = 0;
+					time(&t->start_time);
+
+					// Remove from free list, add to proc list
+					free_task = free_task->next;
+					t->next = proc_task;
+					proc_task = t;
+				}
+				else
+					close(fd);
 			}
 		}
 
 		// Process the data
-		for (i = 0; i < MAXCLIENTS; i++) {
-			if (tasks[i].fd >= 0) {
-				int force_end = 0;
+		struct process_task * t = proc_task;
+		struct process_task * tp = NULL;
+		while (t != NULL) {
+			int force_end = 0;
 
-				// HTTP REQUEST READ
-				if (tasks[i].status == STATUS_REQ) {
-					// Keep reading the request message
-					int readbytes = read(tasks[i].fd,&tasks[i].request_data[tasks[i].request_size],REQUEST_MAX_SIZE-tasks[i].request_size);
-					if (readbytes >= 0) {
-						tasks[i].request_size += readbytes;
+			// HTTP REQUEST READ
+			if (t->status == STATUS_REQ) {
+				// Keep reading the request message
+				int readbytes = read(t->fd,&t->request_data[t->request_size],REQUEST_MAX_SIZE-t->request_size);
+				if (readbytes >= 0) {
+					t->request_size += readbytes;
 
-						if (readbytes > 0)
-							time(&tasks[i].start_time);   // Update timeout
+					if (readbytes > 0)
+						time(&t->start_time);   // Update timeout
 
-						// Put null ends
-						tasks[i].request_data[tasks[i].request_size] = 0;
-						// Check request end, ignore the body!
-						if (strstr(tasks[i].request_data,crlf_crlf) != 0) {
-							// We got all the header, reponse now!
-							tasks[i].status = STATUS_RESP;
-							fdtable[fdtable_lookup(tasks[i].fd)].events = POLLOUT;
-							// Parse the request header
-							
-							int userange = 1;
-							long long fstart = 0;
-							if (header_attr_lookup(tasks[i].request_data,"Range:",crlf) < 0) {
+					// Put null ends
+					t->request_data[t->request_size] = 0;
+					// Check request end, ignore the body!
+					if (strstr(t->request_data,crlf_crlf) != 0) {
+						// We got all the header, reponse now!
+						t->status = STATUS_RESP;
+						fdtable[fdtable_lookup(t->fd)].events = POLLOUT;
+						// Parse the request header
+						
+						int userange = 1;
+						long long fstart = 0;
+						if (header_attr_lookup(t->request_data,"Range:",crlf) < 0) {
+							userange = 0;
+							t->fend = LLONG_MAX;
+						}else{
+							if (parse_range_req(param_str,&fstart,&t->fend) < 0) {
 								userange = 0;
-								tasks[i].fend = LLONG_MAX;
-							}else{
-								if (parse_range_req(param_str,&fstart,&tasks[i].fend) < 0) {
-									userange = 0;
-									fstart = 0;
-									tasks[i].fend = LLONG_MAX;
-								}
+								fstart = 0;
+								t->fend = LLONG_MAX;
 							}
-
-							// Auth
-							int auth_ok = 1;
-							if (auth_str[0] != 0) {
-								if (header_attr_lookup(tasks[i].request_data,"Authorization:",crlf) >= 0) {
-									if (strcmp(param_str, auth_str) != 0)
-										auth_ok = 0;
-								}
-								else auth_ok = 0;
-							}
-							
-							if (auth_ok) {
-								header_attr_lookup(tasks[i].request_data,"GET "," "); // Get the file
-								char file_path[MAX_PATH_LEN*2];
-								int code = path_create(base_path, param_str, file_path, dirlist);
-
-								switch (code) {
-								case RTYPE_404:
-									// Not found! 404 here
-									strcpy(tasks[i].request_data,err_404);
-									tasks[i].request_size = strlen(err_404);
-									break;
-								case RTYPE_DIR:  // Dir
-									tasks[i].dirlist = opendir(file_path);
-									#ifdef HTMLLIST
-										strcpy(tasks[i].request_data,dirlist_200_html);
-									#else
-										strcpy(tasks[i].request_data,dirlist_200_txt);
-									#endif
-									tasks[i].request_size = strlen(tasks[i].request_data);
-									break;
-								case RTYPE_FIL:{// File
-									FILE * fd = fopen(file_path,"rb");
-									long long len = lof(fd);
-									char * mimetype = mime_lookup(file_path);
-									if (tasks[i].fend > len-1) tasks[i].fend = len-1;  // Last byte, not size
-									long long content_length = tasks[i].fend - fstart + 1;
-
-									if (userange) {
-										sprintf(tasks[i].request_data,partial_206,fstart,tasks[i].fend,len,content_length,mimetype);
-										tasks[i].request_size = strlen(tasks[i].request_data);
-									}else{
-										sprintf(tasks[i].request_data,ok_200,content_length,mimetype);
-										tasks[i].request_size = strlen(tasks[i].request_data);
-									}
-									tasks[i].fdfile = fd;
-									fseeko(fd,fstart,SEEK_SET); // Seek the first byte
-									}break;
-								};
-							}
-							else {
-								strcpy(tasks[i].request_data,err_401);
-								tasks[i].request_size = strlen(err_401);
-							}
-							tasks[i].offset = 0;
 						}
-					}
-					else if (errno != EAGAIN && errno != EWOULDBLOCK)
-						force_end = 1;  // Some error, just close
-				}
-				
-				// HTTP RESPONSE BODY WRITE
-				if (tasks[i].status == STATUS_RESP && force_end == 0) {
 
-					if (tasks[i].offset == tasks[i].request_size) { // Try to feed more data into the buffers
-						// Fetch some data from the file
-						if (tasks[i].fdfile) {
-							int toread = WR_BLOCK_SIZE;
-							if (toread > (tasks[i].fend + 1 - ftello(tasks[i].fdfile))) toread = (tasks[i].fend + 1 - ftello(tasks[i].fdfile));
-							if (toread < 0) toread = 0; // File could change its size...
-
-							int numb = fread(tbuffer,1,toread,tasks[i].fdfile);
-							if (numb == 0 || toread == 0) {
-								// End of file, close the connection
-								force_end = 1;
+						// Auth
+						int auth_ok = 1;
+						if (auth_str[0] != 0) {
+							if (header_attr_lookup(t->request_data,"Authorization:",crlf) >= 0) {
+								if (strcmp(param_str, auth_str) != 0)
+									auth_ok = 0;
 							}
-							else if (numb > 0) {
-								// Try to write the data to the socket
-								int bwritten = write(tasks[i].fd,tbuffer,numb);
+							else auth_ok = 0;
+						}
+						
+						if (auth_ok) {
+							header_attr_lookup(t->request_data,"GET "," "); // Get the file
+							char file_path[MAX_PATH_LEN*2];
+							int code = path_create(base_path, param_str, file_path, dirlist);
 
-								// Seek back if necessary
-								int bw = bwritten >= 0 ? bwritten : 0;
-								fseek(tasks[i].fdfile,-numb+bw,SEEK_CUR);
-
-								if (bwritten >= 0) {
-									time(&tasks[i].start_time);   // Update timeout
-								}
-								else if (errno != EAGAIN && errno != EWOULDBLOCK)
-									force_end = 1;  // Some unknown error!
-							}
-							else
-								force_end = 1;
-						} else if (tasks[i].dirlist) {
-							struct dirent *ep = readdir(tasks[i].dirlist);
-							if (ep) {
-								const char * slash = ep->d_type == DT_DIR ? "/" : "";
+							switch (code) {
+							case RTYPE_404:
+								// Not found! 404 here
+								strcpy(t->request_data,err_404);
+								t->request_size = strlen(err_404);
+								break;
+							case RTYPE_DIR:  // Dir
+								t->dirlist = opendir(file_path);
 								#ifdef HTMLLIST
-									sprintf(tasks[i].request_data, "<a href=\"%s%s\">%s%s</a><br>\n", ep->d_name, slash, ep->d_name, slash);
+									strcpy(t->request_data,dirlist_200_html);
 								#else
-									sprintf(tasks[i].request_data, "%s%s\n", ep->d_name, slash);
+									strcpy(t->request_data,dirlist_200_txt);
 								#endif
-								tasks[i].offset = 0;
-								tasks[i].request_size = strlen(tasks[i].request_data);
-							} else {
-								closedir(tasks[i].dirlist);
-								force_end = 1;
+								t->request_size = strlen(t->request_data);
+								break;
+							case RTYPE_FIL:{// File
+								FILE * fd = fopen(file_path,"rb");
+								long long len = lof(fd);
+								char * mimetype = mime_lookup(file_path);
+								if (t->fend > len-1) t->fend = len-1;  // Last byte, not size
+								long long content_length = t->fend - fstart + 1;
+
+								if (userange) {
+									sprintf(t->request_data,partial_206,fstart,t->fend,len,content_length,mimetype);
+									t->request_size = strlen(t->request_data);
+								}else{
+									sprintf(t->request_data,ok_200,content_length,mimetype);
+									t->request_size = strlen(t->request_data);
+								}
+								t->fdfile = fd;
+								fseeko(fd,fstart,SEEK_SET); // Seek the first byte
+								}break;
+							};
+						}
+						else {
+							strcpy(t->request_data,err_401);
+							t->request_size = strlen(err_401);
+						}
+						t->offset = 0;
+					}
+				}
+				else if (errno != EAGAIN && errno != EWOULDBLOCK)
+					force_end = 1;  // Some error, just close
+			}
+			
+			// HTTP RESPONSE BODY WRITE
+			if (t->status == STATUS_RESP && !force_end) {
+
+				if (t->offset == t->request_size) { // Try to feed more data into the buffers
+					// Fetch some data from the file
+					if (t->fdfile) {
+						int toread = WR_BLOCK_SIZE;
+						if (toread > (t->fend + 1 - ftello(t->fdfile))) toread = (t->fend + 1 - ftello(t->fdfile));
+						if (toread < 0) toread = 0; // File could change its size...
+
+						int numb = fread(tbuffer,1,toread,t->fdfile);
+						if (numb == 0 || toread == 0) {
+							// End of file, close the connection
+							force_end = 1;
+						}
+						else if (numb > 0) {
+							// Try to write the data to the socket
+							int bwritten = write(t->fd,tbuffer,numb);
+
+							// Seek back if necessary
+							int bw = bwritten >= 0 ? bwritten : 0;
+							fseek(t->fdfile,-numb+bw,SEEK_CUR);
+
+							if (bwritten >= 0) {
+								time(&t->start_time);   // Update timeout
 							}
+							else if (errno != EAGAIN && errno != EWOULDBLOCK)
+								force_end = 1;  // Some unknown error!
+						}
+						else
+							force_end = 1;
+					} else if (t->dirlist) {
+						struct dirent *ep = readdir(t->dirlist);
+						if (ep) {
+							const char * slash = ep->d_type == DT_DIR ? "/" : "";
+							#ifdef HTMLLIST
+								sprintf(t->request_data, "<a href=\"%s%s\">%s%s</a><br>\n", ep->d_name, slash, ep->d_name, slash);
+							#else
+								sprintf(t->request_data, "%s%s\n", ep->d_name, slash);
+							#endif
+							t->offset = 0;
+							t->request_size = strlen(t->request_data);
 						} else {
+							closedir(t->dirlist);
 							force_end = 1;
 						}
 					}
-
-					if (tasks[i].offset < tasks[i].request_size) {  // Header
-						int bwritten = write(tasks[i].fd,&tasks[i].request_data[tasks[i].offset],tasks[i].request_size-tasks[i].offset);
-
-						if (bwritten >= 0) {
-							tasks[i].offset += bwritten;
-							time(&tasks[i].start_time);   // Update timeout
-						}
-						else if (errno != EAGAIN && errno != EWOULDBLOCK)
-							force_end = 1;  // Some unknown error!
-					}
+					else
+						force_end = 1;
 				}
 
-				// TIMEOUT CLOSE CONNECTION!
-				long cur_time; time(&cur_time);
-				if (cur_time-tasks[i].start_time > ctimeout)
-					force_end = 1;
+				if (t->offset < t->request_size) {  // Header
+					int bwritten = write(t->fd,&t->request_data[t->offset],t->request_size-t->offset);
 
-				// CONNECTION CLOSE
-				if (force_end == 1) {
-					if (tasks[i].fdfile != 0)
-						fclose(tasks[i].fdfile);
-
-					tasks[i].end = 1;   // Mark close
-				}
-
-				if (tasks[i].end) {  // Try to close the socket
-					// close connection and update the fdtable
-					if (close(tasks[i].fd) == 0) {
-						for (k = 0; k < MAXCLIENTS; k++)
-							if (fdtable[k].fd == tasks[i].fd) {
-								for (j = k; j < MAXCLIENTS; j++)
-									fdtable[j].fd = fdtable[j+1].fd;
-								fdtable[MAXCLIENTS].fd = -1;
-								break;
-							}
-						tasks[i].fd = -1;
-						tasks[i].fdfile = 0;
-						tasks[i].end = 0;
-						num_active_clients--;
+					if (bwritten >= 0) {
+						t->offset += bwritten;
+						time(&t->start_time);   // Update timeout
 					}
+					else if (errno != EAGAIN && errno != EWOULDBLOCK)
+						force_end = 1;  // Some unknown error!
 				}
 			}
+
+			// Connection timeouts
+			long cur_time; time(&cur_time);
+			if (cur_time-t->start_time > ctimeout)
+				force_end = 1;
+
+			struct process_task * nextt = t->next;
+			if (force_end) { // Try to close the socket
+				// close connection and update the fdtable
+				close(t->fd);
+				for (k = 0; k < MAXCLIENTS; k++) {
+					if (fdtable[k].fd == t->fd) {
+						for (j = k; j < MAXCLIENTS; j++)
+							fdtable[j].fd = fdtable[j+1].fd;
+						fdtable[MAXCLIENTS].fd = -1;
+						break;
+					}
+				}
+				if (t->fdfile != 0)
+					fclose(t->fdfile);
+				t->fd = -1;
+				t->fdfile = 0;
+				num_active_clients--;
+
+				// Remove from procesing list
+				// do not advance tp!
+				if (tp)
+					tp->next = t->next;
+				else
+					proc_task = t->next;
+
+				t->next = free_task;
+				free_task = t;
+			}
+			else // Regular list advance
+				tp = t;
+
+			t = nextt;
 		}
 	}
 }

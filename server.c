@@ -28,11 +28,12 @@ const unsigned char * crlf = &crlf_crlf[2];
 
 const unsigned char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 const unsigned char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+const unsigned char err_405[] = "HTTP/1.1 405 Method not allowed\r\nConnection: close\r\n\r\n";
 const unsigned char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
 const unsigned char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 
-const unsigned char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
-const unsigned char dirlist_200_html[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
+const unsigned char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
+const unsigned char dirlist_200_html[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
 
 // Temporary buffer for main thread usage
 char tbuffer[WR_BLOCK_SIZE];
@@ -258,22 +259,32 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 						}
 						
 						if (auth_ok) {
-							header_attr_lookup(t->request_data,"GET "," "); // Get the file
+							int ishead = 0;
+							int isget = header_attr_lookup(t->request_data, "GET ", " ") >= 0; // Get the file
+							if (!isget)
+								ishead = header_attr_lookup(t->request_data, "HEAD ", " ") >= 0; // Get the file
 							char file_path[MAX_PATH_LEN*2];
 							int code = path_create(base_path, param_str, file_path, dirlist);
+							if (!isget && !ishead) code = RTYPE_405;
 
 							switch (code) {
+							case RTYPE_405:
+								// Spit at any other HTTP method
+								strcpy(t->request_data, err_405);
+								t->request_size = strlen(err_405);
+								break;
 							case RTYPE_404:
 								// Not found! 404 here
-								strcpy(t->request_data,err_404);
+								strcpy(t->request_data, err_404);
 								t->request_size = strlen(err_404);
 								break;
 							case RTYPE_DIR:  // Dir
-								t->dirlist = opendir(file_path);
+								if (!ishead)
+									t->dirlist = opendir(file_path);
 								#ifdef HTMLLIST
-									strcpy(t->request_data,dirlist_200_html);
+									sprintf(t->request_data, dirlist_200_html, dirlist_size(file_path));
 								#else
-									strcpy(t->request_data,dirlist_200_txt);
+									sprintf(t->request_data, dirlist_200_txt, dirlist_size(file_path));
 								#endif
 								t->request_size = strlen(t->request_data);
 								break;
@@ -284,15 +295,20 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 								if (t->fend > len-1) t->fend = len-1;  // Last byte, not size
 								long long content_length = t->fend - fstart + 1;
 
-								if (userange) {
-									sprintf(t->request_data,partial_206,fstart,t->fend,len,content_length,mimetype);
+								if (userange && isget) {
+									sprintf(t->request_data, partial_206, fstart, t->fend, len,content_length, mimetype);
 									t->request_size = strlen(t->request_data);
 								}else{
-									sprintf(t->request_data,ok_200,content_length,mimetype);
+									sprintf(t->request_data, ok_200, content_length, mimetype);
 									t->request_size = strlen(t->request_data);
 								}
-								t->fdfile = fd;
-								fseeko(fd,fstart,SEEK_SET); // Seek the first byte
+
+								if (ishead) {
+									fclose(fd);
+								} else {
+									t->fdfile = fd;
+									fseeko(fd, fstart, SEEK_SET); // Seek the first byte
+								}
 								}break;
 							};
 						}
@@ -341,12 +357,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 					} else if (t->dirlist) {
 						struct dirent *ep = readdir(t->dirlist);
 						if (ep) {
-							const char * slash = ep->d_type == DT_DIR ? "/" : "";
-							#ifdef HTMLLIST
-								sprintf(t->request_data, "<a href=\"%s%s\">%s%s</a><br>\n", ep->d_name, slash, ep->d_name, slash);
-							#else
-								sprintf(t->request_data, "%s%s\n", ep->d_name, slash);
-							#endif
+							generate_dir_entry(t->request_data, ep);
 							t->offset = 0;
 							t->request_size = strlen(t->request_data);
 						} else {

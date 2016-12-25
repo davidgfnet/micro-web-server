@@ -22,6 +22,7 @@
 #define RTYPE_404    0
 #define RTYPE_DIR    1
 #define RTYPE_FIL    2
+#define RTYPE_405    3
 
 void urldecode (char * dest, const char *url);
 
@@ -44,6 +45,30 @@ int header_attr_lookup(const char * request, const char * param, const char * pa
 	param_str[len] = 0;
 
 	return len;  // Returns the size of the parameter
+}
+
+void generate_dir_entry(char * out, const struct dirent * ep) {
+	const char * slash = ep->d_type == DT_DIR ? "/" : "";
+	#ifdef HTMLLIST
+		sprintf(out, "<a href=\"%s%s\">%s%s</a><br>\n", ep->d_name, slash, ep->d_name, slash);
+	#else
+		sprintf(out, "%s%s\n", ep->d_name, slash);
+	#endif
+}
+
+unsigned dirlist_size(const char * file_path) {
+	char tmp[4*1024];
+	unsigned r = 0;
+	DIR * d = opendir(file_path);
+	while (1) {
+		struct dirent *ep = readdir(d);
+		if (!ep) break;
+
+		generate_dir_entry(tmp, ep);
+		r += strlen(tmp);
+	}
+	closedir(d);
+	return r;
 }
 
 int parse_range_req(const char * req_val, long long * start, long long * end) {

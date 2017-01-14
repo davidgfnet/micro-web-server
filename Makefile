@@ -1,6 +1,6 @@
 
 all:
-	gcc -O2 -o server server.c 
+	gcc -O2 -ggdb -o server server.c -Wall
 	strip -s server
 
 clean:

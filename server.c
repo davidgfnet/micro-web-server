@@ -16,6 +16,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <assert.h>
 
 #include "server_config.h"
 #include "server.h"
@@ -23,40 +24,23 @@
 #define STATUS_REQ         0               
 #define STATUS_RESP        1
 
-const unsigned char crlf_crlf[5] = {0xD,0xA,0xD,0xA,0x0};
-const unsigned char * crlf = &crlf_crlf[2];
+const char *crlf_crlf = "\r\n\r\n";
+const char *crlf = "\r\n";
 
-const unsigned char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
-const unsigned char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-const unsigned char err_405[] = "HTTP/1.1 405 Method not allowed\r\nConnection: close\r\n\r\n";
-const unsigned char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
-const unsigned char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
+const char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
+const char err_403[] = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+const char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+const char err_405[] = "HTTP/1.1 405 Method not allowed\r\nConnection: close\r\n\r\n";
+const char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
+const char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 
-const unsigned char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
-const unsigned char dirlist_200_html[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
+const char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
+const char dirlist_200_html[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
 
 // Temporary buffer for main thread usage
 char tbuffer[WR_BLOCK_SIZE];
 
 char auth_str[128]; // "Basic dXNlcjpwYXNz";
-
-struct mime_type {
-	char extension[6];
-	char mime_type[32];
-};
-struct mime_type mtypes[12] = {	{"",		"application/octet-stream"},  // Default mime type
-								{"htm",		"text/html"},
-								{"html",	"text/html"},
-								{"css",		"text/css"},
-								{"gif",		"image/gif"},
-								{"png",		"image/png"},
-								{"jpg",		"image/jpeg"},
-								{"jpeg",	"image/jpeg"},
-								{"bmp",		"image/bmp"},
-								{"xml",		"text/xml"},
-								{"mp3",		"audio/mpeg"},
-								{"avi",		"video/x-msvideo"}
-							};
 
 struct process_task {
 	int fd;
@@ -95,17 +79,17 @@ int setNonblocking(int fd) {
 #endif
 }
 
-char * mime_lookup(char * file) {
+const char * mime_lookup(char * file) {
 	char * extension = &file[strlen(file)-1];
 	while (*extension != '.') {
-		if (((size_t)extension) < ((size_t)file))
+		if (((uintptr_t)extension) < ((uintptr_t)file))
 			return mtypes[0].mime_type;  // No extension, default type
 		extension--;
 	}
+	// Skip dot
 	extension++;
 
-	int i;
-	for (i = 1; i < sizeof(mtypes)/sizeof(struct mime_type); i++) {
+	for (unsigned i = 1; i < sizeof(mtypes)/sizeof(struct mime_type); i++) {
 		if (strcasecmp(extension,mtypes[i].extension) == 0) {
 			return mtypes[i].mime_type;
 		}
@@ -120,7 +104,6 @@ long long lof(FILE * fd) {
 	fseeko(fd,pos,SEEK_SET);
 	return len;
 }
-
 
 void process_exit(int signal) {
 	// Close all the connections and files
@@ -181,32 +164,32 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 		// Unblock if more than 1 second have elapsed (to allow killing dead connections)
 		poll(fdtable, num_active_clients+1, 1000);
 
-		if (num_active_clients < MAXCLIENTS) {
-			int fd = accept(listenfd, NULL, NULL);
-			if (fd != -1) {
-				setNonblocking(fd);
+		int fd = accept(listenfd, NULL, NULL);
+		if (fd != -1) {
+			setNonblocking(fd);
 
-				if (free_task != 0) {
-					// Add the fd to the poll wait table!
-					int i = ++num_active_clients;
-					fdtable[i].fd = fd;
-					fdtable[i].events = POLLIN;  // By default we read (the request)
+			if (free_task != 0) {
+				// Add the fd to the poll wait table!
+				assert(num_active_clients < MAXCLIENTS);
+				int i = ++num_active_clients;
+				fdtable[i].fd = fd;
+				fdtable[i].events = POLLIN;  // By default we read (the request)
 
-					struct process_task * t = free_task;
-					t->fd = fd;
-					t->request_size = 0;
-					t->status = STATUS_REQ;
-					t->fdfile = 0;
-					t->dirlist = 0;
-					time(&t->start_time);
+				struct process_task * t = free_task;
+				t->fd = fd;
+				t->request_size = 0;
+				t->status = STATUS_REQ;
+				t->fdfile = 0;
+				t->dirlist = 0;
+				time(&t->start_time);
 
-					// Remove from free list, add to proc list
-					free_task = free_task->next;
-					t->next = proc_task;
-					proc_task = t;
-				}
-				else
-					close(fd);
+				// Remove from free list, add to proc list
+				free_task = free_task->next;
+				t->next = proc_task;
+				proc_task = t;
+			} else {
+				assert(num_active_clients == MAXCLIENTS);
+				close(fd);
 			}
 		}
 
@@ -229,7 +212,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 					// Put null ends
 					t->request_data[t->request_size] = 0;
 					// Check request end, ignore the body!
-					if (strstr(t->request_data,crlf_crlf) != 0) {
+					if (strstr((char*)t->request_data, crlf_crlf) != 0) {
 						// We got all the header, reponse now!
 						t->status = STATUS_RESP;
 						fdtable[fdtable_lookup(t->fd)].events = POLLOUT;
@@ -237,7 +220,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 						
 						int userange = 1;
 						long long fstart = 0;
-						if (header_attr_lookup(t->request_data,"Range:",crlf) < 0) {
+						if (header_attr_lookup((char*)t->request_data, "Range:", crlf) < 0) {
 							userange = 0;
 							t->fend = LLONG_MAX;
 						}else{
@@ -251,7 +234,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 						// Auth
 						int auth_ok = 1;
 						if (auth_str[0] != 0) {
-							if (header_attr_lookup(t->request_data,"Authorization:",crlf) >= 0) {
+							if (header_attr_lookup((char*)t->request_data, "Authorization:", crlf) >= 0) {
 								if (strcmp(param_str, auth_str) != 0)
 									auth_ok = 0;
 							}
@@ -260,47 +243,47 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 						
 						if (auth_ok) {
 							int ishead = 0;
-							int isget = header_attr_lookup(t->request_data, "GET ", " ") >= 0; // Get the file
+							int isget = header_attr_lookup((char*)t->request_data, "GET ", " ") >= 0; // Get the file
 							if (!isget)
-								ishead = header_attr_lookup(t->request_data, "HEAD ", " ") >= 0; // Get the file
+								ishead = header_attr_lookup((char*)t->request_data, "HEAD ", " ") >= 0; // Get the file
 							char file_path[MAX_PATH_LEN*2];
-							int code = path_create(base_path, param_str, file_path, dirlist);
+							int code = path_create(base_path, param_str, file_path);
 							if (!isget && !ishead) code = RTYPE_405;
+							if (code == RTYPE_DIR && !dirlist) code = RTYPE_403;
 
 							switch (code) {
-							case RTYPE_405:
-								// Spit at any other HTTP method
-								strcpy(t->request_data, err_405);
-								t->request_size = strlen(err_405);
+							case RTYPE_403:
+								RETURN_STRBUF(t, err_403);
 								break;
 							case RTYPE_404:
-								// Not found! 404 here
-								strcpy(t->request_data, err_404);
-								t->request_size = strlen(err_404);
+								RETURN_STRBUF(t, err_404);
+								break;
+							case RTYPE_405:
+								RETURN_STRBUF(t, err_405);
 								break;
 							case RTYPE_DIR:  // Dir
 								if (!ishead)
 									t->dirlist = opendir(file_path);
 								#ifdef HTMLLIST
-									sprintf(t->request_data, dirlist_200_html, dirlist_size(file_path));
+									sprintf((char*)t->request_data, dirlist_200_html, dirlist_size(file_path));
 								#else
-									sprintf(t->request_data, dirlist_200_txt, dirlist_size(file_path));
+									sprintf((char*)t->request_data, dirlist_200_txt, dirlist_size(file_path));
 								#endif
-								t->request_size = strlen(t->request_data);
+								t->request_size = strlen((char*)t->request_data);
 								break;
 							case RTYPE_FIL:{// File
 								FILE * fd = fopen(file_path,"rb");
 								long long len = lof(fd);
-								char * mimetype = mime_lookup(file_path);
+								const char * mimetype = mime_lookup(file_path);
 								if (t->fend > len-1) t->fend = len-1;  // Last byte, not size
 								long long content_length = t->fend - fstart + 1;
 
 								if (userange && isget) {
-									sprintf(t->request_data, partial_206, fstart, t->fend, len,content_length, mimetype);
-									t->request_size = strlen(t->request_data);
+									sprintf((char*)t->request_data, partial_206, fstart, t->fend, len,content_length, mimetype);
+									t->request_size = strlen((char*)t->request_data);
 								}else{
-									sprintf(t->request_data, ok_200, content_length, mimetype);
-									t->request_size = strlen(t->request_data);
+									sprintf((char*)t->request_data, ok_200, content_length, mimetype);
+									t->request_size = strlen((char*)t->request_data);
 								}
 
 								if (ishead) {
@@ -313,8 +296,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 							};
 						}
 						else {
-							strcpy(t->request_data,err_401);
-							t->request_size = strlen(err_401);
+							RETURN_STRBUF(t, err_401);
 						}
 						t->offset = 0;
 					}
@@ -357,9 +339,8 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 					} else if (t->dirlist) {
 						struct dirent *ep = readdir(t->dirlist);
 						if (ep) {
-							generate_dir_entry(t->request_data, ep);
+							t->request_size = generate_dir_entry(t->request_data, ep);
 							t->offset = 0;
-							t->request_size = strlen(t->request_data);
 						} else {
 							closedir(t->dirlist);
 							force_end = 1;
@@ -423,40 +404,31 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 }
 
 int main (int argc, char ** argv) {
-	int port = 80;
-	int timeout = 8;
-	int dirlist = 0;
-	unsigned char base_path[MAX_PATH_LEN] = {0};
-	getcwd(base_path,MAX_PATH_LEN-1);
-	char sw_user [256];
-	strcpy(sw_user,"nobody");
+	int port = 80, timeout = 8, dirlist = 0;
+	char base_path[MAX_PATH_LEN] = {0};
+	getcwd(base_path, MAX_PATH_LEN-1);
+	char sw_user[256] = "nobody";
 
 	int i;
 	for (i = 1; i < argc; i++) {
 		// Port
-		if (strcmp(argv[i],"-p") == 0) {
-			sscanf(argv[i+1],"%d",&port);
-		}
+		if (strcmp(argv[i],"-p") == 0)
+			sscanf(argv[++i], "%d", &port);
 		// Timeout
-		if (strcmp(argv[i],"-t") == 0) {
-			sscanf(argv[i+1],"%d",&timeout);
-		}
+		if (strcmp(argv[i],"-t") == 0)
+			sscanf(argv[++i], "%d", &timeout);
 		// Base dir
-		if (strcmp(argv[i],"-d") == 0) {
-			strcpy(base_path,argv[i+1]);
-		}
+		if (strcmp(argv[i],"-d") == 0)
+			strcpy(base_path, argv[++i]);
 		// Dir list
-		if (strcmp(argv[i],"-l") == 0) {
+		if (strcmp(argv[i],"-l") == 0)
 			dirlist = 1;
-		}
 		// User drop
-		if (strcmp(argv[i],"-u") == 0) {
-			strcpy(sw_user, argv[i+1]);
-		}
+		if (strcmp(argv[i],"-u") == 0)
+			strcpy(sw_user, argv[++i]);
 		// Auth
-		if (strcmp(argv[i],"-a") == 0) {
-			strcpy(auth_str, argv[i+1]);
-		}
+		if (strcmp(argv[i],"-a") == 0)
+			strcpy(auth_str, argv[++i]);
 		// Help
 		if (strcmp(argv[i],"-h") == 0) {
 			printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
@@ -482,7 +454,7 @@ int main (int argc, char ** argv) {
 	int yes = 1;
 	setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
 	if (bind(listenfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0) {
-		printf("Error binding the port.\n",errno); perror("bind"); exit(1);
+		printf("Error %u binding the port.\n", errno); perror("bind"); exit(1);
 	}
 
 	// Switch to user

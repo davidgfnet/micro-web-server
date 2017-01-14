@@ -23,8 +23,15 @@
 #define RTYPE_DIR    1
 #define RTYPE_FIL    2
 #define RTYPE_405    3
+#define RTYPE_403    4
 
 void urldecode (char * dest, const char *url);
+
+#define RETURN_STRBUF(task, buffer) \
+	{ \
+		strcpy((char*)task->request_data, (char*)buffer); \
+		task->request_size = strlen((char*)buffer); \
+	}
 
 // writes to param_str the value of the parameter in the request trimming whitespaces
 static char param_str[REQUEST_MAX_SIZE*3];
@@ -47,13 +54,14 @@ int header_attr_lookup(const char * request, const char * param, const char * pa
 	return len;  // Returns the size of the parameter
 }
 
-void generate_dir_entry(char * out, const struct dirent * ep) {
+unsigned generate_dir_entry(void * out, const struct dirent * ep) {
 	const char * slash = ep->d_type == DT_DIR ? "/" : "";
 	#ifdef HTMLLIST
-		sprintf(out, "<a href=\"%s%s\">%s%s</a><br>\n", ep->d_name, slash, ep->d_name, slash);
+		sprintf((char*)out, "<a href=\"%s%s\">%s%s</a><br>\n", ep->d_name, slash, ep->d_name, slash);
 	#else
-		sprintf(out, "%s%s\n", ep->d_name, slash);
+		sprintf((char*)out, "%s%s\n", ep->d_name, slash);
 	#endif
+	return strlen((char*)out);
 }
 
 unsigned dirlist_size(const char * file_path) {
@@ -64,8 +72,7 @@ unsigned dirlist_size(const char * file_path) {
 		struct dirent *ep = readdir(d);
 		if (!ep) break;
 
-		generate_dir_entry(tmp, ep);
-		r += strlen(tmp);
+		r += generate_dir_entry(tmp, ep);
 	}
 	closedir(d);
 	return r;
@@ -131,7 +138,7 @@ void strcpy_o(char * dest, char * src) {
 	*dest = 0;
 }
 
-int path_create(const char * base_path, const char * req_file, char * out_file, int dirlist) {
+int path_create(const char * base_path, const char * req_file, char * out_file) {
 	char temp[ strlen(req_file)+1 ];
 	strcpy(temp, req_file);
 	
@@ -195,12 +202,10 @@ int path_create(const char * base_path, const char * req_file, char * out_file, 
 	}
 
 	// Try to open the dir
-	if (dirlist) {
-		void * ptr = opendir(out_file);
-		if (ptr) {
-			closedir(ptr);
-			return RTYPE_DIR;
-		}
+	void * ptr = opendir(out_file);
+	if (ptr) {
+		closedir(ptr);
+		return RTYPE_DIR;
 	}
 
 	// Try as file

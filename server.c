@@ -29,10 +29,11 @@
 #define STATUS_PROXY_FWD   5
 
 const char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
+const char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
 const char err_403[] = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
 const char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
 const char err_405[] = "HTTP/1.1 405 Method not allowed\r\nConnection: close\r\n\r\n";
-const char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
+const char err_413[] = "HTTP/1.1 413 Request Entity Too Large\r\nConnection: close\r\n\r\n";
 const char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 
 const char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
@@ -212,9 +213,6 @@ int work_proxy(struct process_task * t) {
 
 				if (t->offset == t->request_size) {
 					t->status = STATUS_PROXY_FWD;
-					t->request_size = 0;
-					t->offset = 0;
-
 					epollupdate(t->remotefd, POLLIN, t);
 				}
 			}
@@ -257,13 +255,30 @@ int work_proxy(struct process_task * t) {
 }
 #endif
 
+int check_auth(struct process_task *t) {
+	// Auth
+	if (auth_str[0] != 0) {
+		if (header_attr_lookup((char*)t->request_data, "Authorization:", "\r\n") >= 0) {
+			if (strcmp(param_str, auth_str) != 0)
+				return 0;
+		}
+		return 0;
+	}
+	return 1;
+}
+
 int work_request(struct process_task * t, const char * base_path, int dirlist, int beproxy) {
+	// We don't support long requests due to small buffers
+	if (t->request_size >= REQUEST_MAX_SIZE) {
+		t->status = STATUS_RESP;
+		epollupdate(t->fd, POLLOUT, t);
+		RETURN_STRBUF(t, err_413)
+	}			
+
 	int readbytes = read(t->fd, &t->request_data[t->request_size], REQUEST_MAX_SIZE - t->request_size);
 	if (readbytes >= 0) {
 		t->request_size += readbytes;
-
-		if (readbytes > 0)
-			time(&t->start_time);   // Update timeout
+		if (readbytes > 0) time(&t->start_time);
 
 		// Put null ends
 		t->request_data[t->request_size] = 0;
@@ -287,19 +302,8 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 				}
 			}
 
-			// Auth
-			int auth_ok = 1;
-			if (auth_str[0] != 0) {
-				if (header_attr_lookup((char*)t->request_data, "Authorization:", "\r\n") >= 0) {
-					if (strcmp(param_str, auth_str) != 0)
-						auth_ok = 0;
-				}
-				else auth_ok = 0;
-			}
-			if (!auth_ok) {
+			if (!check_auth(t))
 				RETURN_STRBUF(t, err_401);
-				return 0;
-			}
 
 			int ishead = 0;
 			int isget = header_attr_lookup((char*)t->request_data, "GET ", " ") >= 0; // Get the file
@@ -311,15 +315,9 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 			if (code == RTYPE_DIR && !dirlist) code = RTYPE_403;
 
 			switch (code) {
-			case RTYPE_403:
-				RETURN_STRBUF(t, err_403);
-				break;
-			case RTYPE_404:
-				RETURN_STRBUF(t, err_404);
-				break;
-			case RTYPE_405:
-				RETURN_STRBUF(t, err_405);
-				break;
+			case RTYPE_403: RETURN_STRBUF(t, err_403);
+			case RTYPE_404: RETURN_STRBUF(t, err_404);
+			case RTYPE_405: RETURN_STRBUF(t, err_405);
 			case RTYPE_DIR:  // Dir
 				if (!ishead)
 					t->dirlist = opendir(file_path);
@@ -387,11 +385,7 @@ int work_response(struct process_task * t) {
 			if (toread < 0) toread = 0; // File could change its size...
 
 			int numb = fread(tbuffer,1,toread,t->fdfile);
-			if (numb == 0 || toread == 0) {
-				// End of file, close the connection
-				return 1;
-			}
-			else if (numb > 0) {
+			if (numb > 0) {
 				// Try to write the data to the socket
 				int bwritten = write(t->fd,tbuffer,numb);
 
@@ -405,7 +399,7 @@ int work_response(struct process_task * t) {
 				else if (errno != EAGAIN && errno != EWOULDBLOCK)
 					return 1;  // Some unknown error!
 			}
-			else
+			else  // Error or end of file
 				return 1;
 		} else if (t->dirlist) {
 			struct dirent *ep = readdir(t->dirlist);
@@ -432,7 +426,6 @@ int work_response(struct process_task * t) {
 		else if (errno != EAGAIN && errno != EWOULDBLOCK)
 			return 1;  // Some unknown error!
 	}
-
 	return 0;
 }
 
@@ -520,7 +513,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 				force_end |= work_response(t);
 
 			// Close on error o timeout
-			if (time() - t->start_time > ctimeout || force_end) {
+			if (time(0) - t->start_time > ctimeout || force_end) {
 				cleanup_task(t);
 				t->next = free_task;
 				free_task = t;
@@ -530,7 +523,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 }
 
 int main (int argc, char ** argv) {
-	int port = 80, timeout = 8, dirlist = 0, beproxy = 1;
+	int port = 8080, timeout = 8, dirlist = 0, beproxy = 0;
 	char base_path[MAX_PATH_LEN] = {0};
 	getcwd(base_path, MAX_PATH_LEN-1);
 	char sw_user[256] = "nobody";
@@ -556,18 +549,22 @@ int main (int argc, char ** argv) {
 		if (strcmp(argv[i],"-a") == 0)
 			strcpy(auth_str, argv[++i]);
 		// URL proxy
+		#ifdef HTTP_PROXY_ENABLED
 		if (strcmp(argv[i],"-x") == 0)
 			beproxy = 1;
+		#endif
 		// Help
 		if (strcmp(argv[i],"-h") == 0) {
 			printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
-			"    -p     Port             (Default port is 80)\n"
+			"    -p     Port             (Default port is 8080)\n"
 			"    -t     Timeout          (Default timeout is 8 seconds of network inactivity)\n"
 			"    -d     Base Dir         (Default dir is working dir)\n"
 			"    -l     Enable dir lists (Off by default for security reasons)\n"
 			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody))\n"
 			"    -a     HTTP Auth        (Specify an auth string, i.e. \"Basic dXNlcjpwYXNz\")\n"
+			#ifdef HTTP_PROXY_ENABLED
 			"    -x     URL proxy        (This disables the file serving)\n"
+			#endif
 			);
 			exit(0);
 		}

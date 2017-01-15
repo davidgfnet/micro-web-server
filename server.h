@@ -32,6 +32,7 @@ void urldecode (char * dest, const char *url);
 	{ \
 		strcpy((char*)task->request_data, (char*)buffer); \
 		task->request_size = strlen((char*)buffer); \
+		return 0; \
 	}
 
 // writes to param_str the value of the parameter in the request trimming whitespaces

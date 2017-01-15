@@ -24,6 +24,7 @@
 #define RTYPE_FIL    2
 #define RTYPE_405    3
 #define RTYPE_403    4
+#define RTYPE_PROXY  5
 
 void urldecode (char * dest, const char *url);
 
@@ -242,7 +243,27 @@ int ishexpair(const char * i) {
 	return 1;
 }
 
+int parse_url(char * in, const char **hostname, int * port, const char ** path) {
+	// URL like server.com[:port]/path/foo/bar
+	while (*in != 0 && *in == '/') in++;  // Skip leading slashes
+	*hostname = in;
 
+	while (*in != 0 && *in != ':' && *in != '/') in++;
+	if (*in == ':') {
+		*in++ = 0;
+		*port = atoi(in);
+		while (*in != 0 && *in != '/') in++;
+	}
+	else
+		*port = 80;
+
+	if (*in == 0)
+		return 0;
+
+	*in++ = 0;
+	*path = in;
+	return 1;
+}
 
 void urldecode (char * dest, const char *url) {
 	int s = 0, d = 0;

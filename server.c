@@ -23,9 +23,10 @@
 
 #define STATUS_REQ         0               
 #define STATUS_RESP        1
-
-const char *crlf_crlf = "\r\n\r\n";
-const char *crlf = "\r\n";
+#define STATUS_PROXY       2
+#define STATUS_PROXY_CON   3
+#define STATUS_PROXY_REQ   4
+#define STATUS_PROXY_FWD   5
 
 const char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 const char err_403[] = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
@@ -37,10 +38,8 @@ const char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: byte
 const char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
 const char dirlist_200_html[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
 
-// Temporary buffer for main thread usage
-char tbuffer[WR_BLOCK_SIZE];
-
-char auth_str[128]; // "Basic dXNlcjpwYXNz";
+char tbuffer[WR_BLOCK_SIZE];  // Temporary buffer for main thread usage
+char auth_str[128];           // eg. "Basic dXNlcjpwYXNz";
 
 struct process_task {
 	int fd;
@@ -52,6 +51,7 @@ struct process_task {
 	unsigned short request_size;
 	unsigned char request_data[REQUEST_MAX_SIZE+1];
 	DIR *dirlist;
+	int remotefd, remoteport;
 
 	// List of free/nonfree tasks
 	struct process_task * next;
@@ -61,7 +61,18 @@ int listenfd;
 struct process_task tasks[MAXCLIENTS];
 struct process_task * free_task = &tasks[0];
 struct process_task * proc_task = NULL;
-struct pollfd fdtable[MAXCLIENTS+1];
+struct pollfd fdtable[MAXCLIENTS + 1 + 1]; // Listen socket + DNS
+
+#ifdef HTTP_PROXY_ENABLED
+#include "tadns.h"
+struct dns * dnsinstance;
+#endif
+
+#define EXIT_ERROR(msg, ecode) \
+	{ \
+		fprintf(stderr, msg); \
+		exit(ecode); \
+	}
 
 int setNonblocking(int fd) {
 	int flags;
@@ -105,64 +116,318 @@ long long lof(FILE * fd) {
 	return len;
 }
 
+void cleanup_task(struct process_task * t) {
+	if (t->dirlist) {
+		closedir(t->dirlist);
+		t->dirlist = 0;
+	}
+	if (t->fdfile) {
+		fclose(t->fdfile);
+		t->fdfile = 0;
+	}
+	if (t->fd >= 0) {
+		close(t->fd);
+		t->fd = -1;
+	}
+	if (t->remotefd >= 0) {
+		close(t->remotefd);
+		t->remotefd = -1;
+	}
+	#ifdef HTTP_PROXY_ENABLED
+	// Try to cancel DNS req, even there is no inflight req
+	dns_cancel(dnsinstance, t);
+	#endif
+}
+
 void process_exit(int signal) {
 	// Close all the connections and files
 	// and then exit
-
 	close(listenfd);
 
-	int i;
-	for (i = 0; i < MAXCLIENTS; i++) {
-		if (tasks[i].fd != -1) close(tasks[i].fd);
-		if (tasks[i].fdfile != 0) fclose(tasks[i].fdfile);
-	}
+	for (unsigned i = 0; i < MAXCLIENTS; i++)
+		cleanup_task(&tasks[i]);
 
 	printf("Terminated by signal %d\n",signal);
 	exit(0);
 }
 
 int fdtable_lookup(int fd) {
-	int k;
-	for (k = 0; k < MAXCLIENTS; k++)
+	for (int k = 0; k < MAXCLIENTS; k++)
 		if (fdtable[k].fd == fd)
 			return k;
+
+	return -1;
+}
+
+void remove_fd(int fd, int * num_active_clients) {
+	int idx = fdtable_lookup(fd);
+	if (idx >= 0) {
+		fdtable[*num_active_clients].fd = -1;
+		for (int j = idx; j < *num_active_clients; j++)
+			fdtable[j].fd = fdtable[j+1].fd;
+	}
+}
+
+#ifdef HTTP_PROXY_ENABLED
+void dnscallback(struct dns_cb_data * cbd) {
+	struct process_task * t = (struct process_task *)cbd->context;
+
+	if (cbd->error != DNS_OK) {
+		// Force timeout
+		t->start_time = 0;
+		return;
+	}
+
+	time(&t->start_time);
+
+	// Start connection
+	t->remotefd = socket(AF_INET, SOCK_STREAM, 0);
+	setNonblocking(listenfd);
+
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(t->remoteport);
+	memcpy(&addr.sin_addr.s_addr, cbd->addr, 4);
+	int r = connect(t->remotefd, (const struct sockaddr*)&addr, sizeof(addr));
+	if (r < 0 && errno != EINPROGRESS) {
+		t->start_time = 0;
+		return;
+	}
+
+	t->status = STATUS_PROXY_CON;
+	int idx = fdtable_lookup(t->fd);
+	fdtable[idx].fd = t->remotefd;
+	fdtable[idx].events = POLLOUT;
+}
+
+int work_proxy(struct process_task * t) {
+	if (t->remotefd >= 0) {
+		if (t->status == STATUS_PROXY_CON) {
+			int result;
+			socklen_t result_len = sizeof(result);
+			if (getsockopt(t->remotefd, SOL_SOCKET, SO_ERROR, &result, &result_len) < 0)
+				return 1;
+			t->status = STATUS_PROXY_REQ;
+		}
+		if (t->status == STATUS_PROXY_REQ) {
+			// Keep sending request to the remote host
+			int w = write(t->remotefd, &t->request_data[t->offset], t->request_size - t->offset);
+			if (w >= 0) {
+				t->offset += w;
+				if (w > 0)
+					time(&t->start_time);
+
+				if (t->offset == t->request_size) {
+					t->status = STATUS_PROXY_FWD;
+					t->request_size = 0;
+					t->offset = 0;
+
+					int idx = fdtable_lookup(t->remotefd);
+					fdtable[idx].events = POLLIN;
+				}
+			}
+			else if (errno != EAGAIN && errno != EWOULDBLOCK)
+				return 1;
+		}
+		if (t->status == STATUS_PROXY_FWD) {
+			if (t->request_size == t->offset) {
+				int r = read(t->remotefd, t->request_data, REQUEST_MAX_SIZE);
+				if (r > 0) {
+					t->request_size = r;
+					t->offset = 0;
+					time(&t->start_time);
+
+					int idx = fdtable_lookup(t->remotefd);
+					fdtable[idx].fd = t->fd;
+					fdtable[idx].events = POLLOUT;
+				}
+				else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+					return 1;
+			}
+			if (t->request_size != t->offset) {
+				int w = write(t->fd, &t->request_data[t->offset], t->request_size - t->offset);
+				if (w >= 0) {
+					t->offset += w;
+					if (w > 0)
+						time(&t->start_time);
+
+					if (t->request_size == t->offset) {
+						int idx = fdtable_lookup(t->fd);
+						fdtable[idx].fd = t->remotefd;
+						fdtable[idx].events = POLLIN;
+					}
+				}
+				else if (errno != EAGAIN && errno != EWOULDBLOCK)
+					return 1;
+			}
+		}
+	}
+
+	return 0;
+}
+#endif
+
+int work_request(struct process_task * t, const char * base_path, int dirlist, int beproxy) {
+	int readbytes = read(t->fd, &t->request_data[t->request_size], REQUEST_MAX_SIZE - t->request_size);
+	if (readbytes >= 0) {
+		t->request_size += readbytes;
+
+		if (readbytes > 0)
+			time(&t->start_time);   // Update timeout
+
+		// Put null ends
+		t->request_data[t->request_size] = 0;
+		// Check request end, ignore the body!
+		if (strstr((char*)t->request_data, "\r\n\r\n") != 0) {
+			// We got all the header, reponse now!
+			t->status = STATUS_RESP;
+			fdtable[fdtable_lookup(t->fd)].events = POLLOUT;
+
+			// Parse the request header			
+			int userange = 1;
+			long long fstart = 0;
+			if (header_attr_lookup((char*)t->request_data, "Range:", "\r\n") < 0) {
+				userange = 0;
+				t->fend = LLONG_MAX;
+			}else{
+				if (parse_range_req(param_str,&fstart,&t->fend) < 0) {
+					userange = 0;
+					fstart = 0;
+					t->fend = LLONG_MAX;
+				}
+			}
+
+			// Auth
+			int auth_ok = 1;
+			if (auth_str[0] != 0) {
+				if (header_attr_lookup((char*)t->request_data, "Authorization:", "\r\n") >= 0) {
+					if (strcmp(param_str, auth_str) != 0)
+						auth_ok = 0;
+				}
+				else auth_ok = 0;
+			}
+			if (!auth_ok) {
+				RETURN_STRBUF(t, err_401);
+				return 0;
+			}
+
+			int ishead = 0;
+			int isget = header_attr_lookup((char*)t->request_data, "GET ", " ") >= 0; // Get the file
+			if (!isget)
+				ishead = header_attr_lookup((char*)t->request_data, "HEAD ", " ") >= 0; // Get the file
+			char file_path[MAX_PATH_LEN*2];
+			int code = beproxy ? RTYPE_PROXY : path_create(base_path, param_str, file_path);
+			if (!isget && !ishead) code = RTYPE_405;
+			if (code == RTYPE_DIR && !dirlist) code = RTYPE_403;
+
+			switch (code) {
+			case RTYPE_403:
+				RETURN_STRBUF(t, err_403);
+				break;
+			case RTYPE_404:
+				RETURN_STRBUF(t, err_404);
+				break;
+			case RTYPE_405:
+				RETURN_STRBUF(t, err_405);
+				break;
+			case RTYPE_DIR:  // Dir
+				if (!ishead)
+					t->dirlist = opendir(file_path);
+				#ifdef HTMLLIST
+					sprintf((char*)t->request_data, dirlist_200_html, dirlist_size(file_path));
+				#else
+					sprintf((char*)t->request_data, dirlist_200_txt, dirlist_size(file_path));
+				#endif
+				t->request_size = strlen((char*)t->request_data);
+				break;
+			case RTYPE_FIL:{// File
+				FILE * fd = fopen(file_path,"rb");
+				long long len = lof(fd);
+				const char * mimetype = mime_lookup(file_path);
+				if (t->fend > len-1) t->fend = len-1;  // Last byte, not size
+				long long content_length = t->fend - fstart + 1;
+
+				if (userange && isget) {
+					sprintf((char*)t->request_data, partial_206, fstart, t->fend, len,content_length, mimetype);
+					t->request_size = strlen((char*)t->request_data);
+				}else{
+					sprintf((char*)t->request_data, ok_200, content_length, mimetype);
+					t->request_size = strlen((char*)t->request_data);
+				}
+
+				if (ishead) {
+					fclose(fd);
+				} else {
+					t->fdfile = fd;
+					fseeko(fd, fstart, SEEK_SET); // Seek the first byte
+				}
+				}break;
+
+			#ifdef HTTP_PROXY_ENABLED
+			case RTYPE_PROXY:{
+				t->status = STATUS_PROXY;
+
+				urldecode(file_path, param_str);
+				const char *hostname, *path;
+				if (parse_url(file_path, &hostname, &t->remoteport, &path)) {
+					// Prepare request
+					sprintf((char*)t->request_data, "GET /%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, hostname);
+					t->request_size = strlen((char*)t->request_data);
+					t->offset = 0;
+					dns_queue(dnsinstance, t, hostname, DNS_A_RECORD, dnscallback);
+				};
+				} break;
+			#endif
+			};
+		}
+	}
+	else if (errno != EAGAIN && errno != EWOULDBLOCK)
+		return 1;  // Some error, just close
 
 	return 0;
 }
 
-void server_run (int port, int ctimeout, char * base_path, int dirlist) {
+
+void server_run (int port, int ctimeout, char * base_path, int dirlist, int beproxy) {
 	signal (SIGTERM, process_exit);
 	signal (SIGHUP, process_exit);
 	signal (SIGINT, process_exit);
 	signal (SIGPIPE, SIG_IGN);
 
 	int num_active_clients = 0;
-	int i,j,k;
 
 	/* Force the network socket into nonblocking mode */
-	if (setNonblocking(listenfd) < 0) {
-		printf("Error  while trying to go NON-BLOCKING\n"); exit(1);
+	if (setNonblocking(listenfd) < 0)
+		EXIT_ERROR("Error  while trying to go NON-BLOCKING\n", 1);
+
+	if (listen(listenfd, 5) < 0) {
+		perror("listen");
+		EXIT_ERROR("Error listening on the port\n", 1);
 	}
 
-	if(listen(listenfd,5) < 0) {
-		printf("Error listening on the port\n"); perror("listen"); exit(1);
-	}
-
-	for (i = 0; i < MAXCLIENTS+1; i++) {
+	for (int i = 0; i < MAXCLIENTS+1; i++) {
 		fdtable[i].fd = -1;
 		fdtable[i].events = POLLIN;  // By default
 		fdtable[i].revents = 0;
 	}
-	for (i = 0; i < MAXCLIENTS; i++) {
+	for (int i = 0; i < MAXCLIENTS; i++) {
 		tasks[i].fd = -1;
 		tasks[i].next = (i != MAXCLIENTS-1) ? &tasks[i+1] : 0;
 		tasks[i].id = i;
 	}
 	fdtable[0].fd = listenfd;
 
-	while(1) {
+	while (1) {
+		int num_sockets = num_active_clients + 1;
+		#ifdef HTTP_PROXY_ENABLED
+		dns_poll(dnsinstance);
+		fdtable[num_sockets].events = POLLIN;
+		fdtable[num_sockets].fd = dns_get_fd(dnsinstance);
+		num_sockets++;
+		#endif
+
 		// Unblock if more than 1 second have elapsed (to allow killing dead connections)
-		poll(fdtable, num_active_clients+1, 1000);
+		poll(fdtable, num_sockets, 1000);
 
 		int fd = accept(listenfd, NULL, NULL);
 		if (fd != -1) {
@@ -181,6 +446,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 				t->status = STATUS_REQ;
 				t->fdfile = 0;
 				t->dirlist = 0;
+				t->offset = 0;
 				time(&t->start_time);
 
 				// Remove from free list, add to proc list
@@ -200,110 +466,14 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 			int force_end = 0;
 
 			// HTTP REQUEST READ
-			if (t->status == STATUS_REQ) {
-				// Keep reading the request message
-				int readbytes = read(t->fd,&t->request_data[t->request_size],REQUEST_MAX_SIZE-t->request_size);
-				if (readbytes >= 0) {
-					t->request_size += readbytes;
+			if (t->status == STATUS_REQ)
+				force_end |= work_request(t, base_path, dirlist, beproxy);
 
-					if (readbytes > 0)
-						time(&t->start_time);   // Update timeout
-
-					// Put null ends
-					t->request_data[t->request_size] = 0;
-					// Check request end, ignore the body!
-					if (strstr((char*)t->request_data, crlf_crlf) != 0) {
-						// We got all the header, reponse now!
-						t->status = STATUS_RESP;
-						fdtable[fdtable_lookup(t->fd)].events = POLLOUT;
-						// Parse the request header
-						
-						int userange = 1;
-						long long fstart = 0;
-						if (header_attr_lookup((char*)t->request_data, "Range:", crlf) < 0) {
-							userange = 0;
-							t->fend = LLONG_MAX;
-						}else{
-							if (parse_range_req(param_str,&fstart,&t->fend) < 0) {
-								userange = 0;
-								fstart = 0;
-								t->fend = LLONG_MAX;
-							}
-						}
-
-						// Auth
-						int auth_ok = 1;
-						if (auth_str[0] != 0) {
-							if (header_attr_lookup((char*)t->request_data, "Authorization:", crlf) >= 0) {
-								if (strcmp(param_str, auth_str) != 0)
-									auth_ok = 0;
-							}
-							else auth_ok = 0;
-						}
-						
-						if (auth_ok) {
-							int ishead = 0;
-							int isget = header_attr_lookup((char*)t->request_data, "GET ", " ") >= 0; // Get the file
-							if (!isget)
-								ishead = header_attr_lookup((char*)t->request_data, "HEAD ", " ") >= 0; // Get the file
-							char file_path[MAX_PATH_LEN*2];
-							int code = path_create(base_path, param_str, file_path);
-							if (!isget && !ishead) code = RTYPE_405;
-							if (code == RTYPE_DIR && !dirlist) code = RTYPE_403;
-
-							switch (code) {
-							case RTYPE_403:
-								RETURN_STRBUF(t, err_403);
-								break;
-							case RTYPE_404:
-								RETURN_STRBUF(t, err_404);
-								break;
-							case RTYPE_405:
-								RETURN_STRBUF(t, err_405);
-								break;
-							case RTYPE_DIR:  // Dir
-								if (!ishead)
-									t->dirlist = opendir(file_path);
-								#ifdef HTMLLIST
-									sprintf((char*)t->request_data, dirlist_200_html, dirlist_size(file_path));
-								#else
-									sprintf((char*)t->request_data, dirlist_200_txt, dirlist_size(file_path));
-								#endif
-								t->request_size = strlen((char*)t->request_data);
-								break;
-							case RTYPE_FIL:{// File
-								FILE * fd = fopen(file_path,"rb");
-								long long len = lof(fd);
-								const char * mimetype = mime_lookup(file_path);
-								if (t->fend > len-1) t->fend = len-1;  // Last byte, not size
-								long long content_length = t->fend - fstart + 1;
-
-								if (userange && isget) {
-									sprintf((char*)t->request_data, partial_206, fstart, t->fend, len,content_length, mimetype);
-									t->request_size = strlen((char*)t->request_data);
-								}else{
-									sprintf((char*)t->request_data, ok_200, content_length, mimetype);
-									t->request_size = strlen((char*)t->request_data);
-								}
-
-								if (ishead) {
-									fclose(fd);
-								} else {
-									t->fdfile = fd;
-									fseeko(fd, fstart, SEEK_SET); // Seek the first byte
-								}
-								}break;
-							};
-						}
-						else {
-							RETURN_STRBUF(t, err_401);
-						}
-						t->offset = 0;
-					}
-				}
-				else if (errno != EAGAIN && errno != EWOULDBLOCK)
-					force_end = 1;  // Some error, just close
-			}
+			#ifdef HTTP_PROXY_ENABLED
+			if ((t->status == STATUS_PROXY || t->status == STATUS_PROXY_REQ ||
+			     t->status == STATUS_PROXY_FWD || t->status == STATUS_PROXY_CON) && !force_end)
+				force_end |= work_proxy(t);
+			#endif
 			
 			// HTTP RESPONSE BODY WRITE
 			if (t->status == STATUS_RESP && !force_end) {
@@ -343,6 +513,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 							t->offset = 0;
 						} else {
 							closedir(t->dirlist);
+							t->dirlist = 0;
 							force_end = 1;
 						}
 					}
@@ -364,25 +535,15 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 
 			// Connection timeouts
 			long cur_time; time(&cur_time);
-			if (cur_time-t->start_time > ctimeout)
+			if (cur_time - t->start_time > ctimeout)
 				force_end = 1;
 
 			struct process_task * nextt = t->next;
 			if (force_end) { // Try to close the socket
 				// close connection and update the fdtable
-				close(t->fd);
-				for (k = 0; k < MAXCLIENTS; k++) {
-					if (fdtable[k].fd == t->fd) {
-						for (j = k; j < MAXCLIENTS; j++)
-							fdtable[j].fd = fdtable[j+1].fd;
-						fdtable[MAXCLIENTS].fd = -1;
-						break;
-					}
-				}
-				if (t->fdfile != 0)
-					fclose(t->fdfile);
-				t->fd = -1;
-				t->fdfile = 0;
+				remove_fd(t->fd, &num_active_clients);
+				remove_fd(t->remotefd, &num_active_clients);
+				cleanup_task(t);
 				num_active_clients--;
 
 				// Remove from procesing list
@@ -404,7 +565,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist) {
 }
 
 int main (int argc, char ** argv) {
-	int port = 80, timeout = 8, dirlist = 0;
+	int port = 80, timeout = 8, dirlist = 0, beproxy = 1;
 	char base_path[MAX_PATH_LEN] = {0};
 	getcwd(base_path, MAX_PATH_LEN-1);
 	char sw_user[256] = "nobody";
@@ -429,6 +590,9 @@ int main (int argc, char ** argv) {
 		// Auth
 		if (strcmp(argv[i],"-a") == 0)
 			strcpy(auth_str, argv[++i]);
+		// URL proxy
+		if (strcmp(argv[i],"-x") == 0)
+			beproxy = 1;
 		// Help
 		if (strcmp(argv[i],"-h") == 0) {
 			printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
@@ -438,6 +602,7 @@ int main (int argc, char ** argv) {
 			"    -l     Enable dir lists (Off by default for security reasons)\n"
 			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody))\n"
 			"    -a     HTTP Auth        (Specify an auth string, i.e. \"Basic dXNlcjpwYXNz\")\n"
+			"    -x     URL proxy        (This disables the file serving)\n"
 			);
 			exit(0);
 		}
@@ -465,8 +630,12 @@ int main (int argc, char ** argv) {
 	}
 	setgid(pw->pw_gid);
 	setuid(pw->pw_uid);
+
+	#ifdef HTTP_PROXY_ENABLED
+	dnsinstance = dns_init();
+	#endif
 	
-	server_run(port, timeout, base_path, dirlist);
+	server_run(port, timeout, base_path, dirlist, beproxy);
 }
 
 

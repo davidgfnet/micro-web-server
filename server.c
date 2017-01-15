@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
@@ -55,13 +55,10 @@ struct process_task {
 
 	// List of free/nonfree tasks
 	struct process_task * next;
-	int id;
 };
-int listenfd;
+int listenfd, epollfd;
 struct process_task tasks[MAXCLIENTS];
 struct process_task * free_task = &tasks[0];
-struct process_task * proc_task = NULL;
-struct pollfd fdtable[MAXCLIENTS + 1 + 1]; // Listen socket + DNS
 
 #ifdef HTTP_PROXY_ENABLED
 #include "tadns.h"
@@ -117,6 +114,9 @@ long long lof(FILE * fd) {
 }
 
 void cleanup_task(struct process_task * t) {
+	epoll_ctl(epollfd, EPOLL_CTL_DEL, t->fd, NULL);
+	epoll_ctl(epollfd, EPOLL_CTL_DEL, t->remotefd, NULL);
+
 	if (t->dirlist) {
 		closedir(t->dirlist);
 		t->dirlist = 0;
@@ -142,30 +142,25 @@ void cleanup_task(struct process_task * t) {
 void process_exit(int signal) {
 	// Close all the connections and files
 	// and then exit
-	close(listenfd);
+	struct process_task * t = free_task;
+	while (t) {
+		cleanup_task(t);
+		t = t->next;
+	}
 
-	for (unsigned i = 0; i < MAXCLIENTS; i++)
-		cleanup_task(&tasks[i]);
+	close(listenfd);
+	close(epollfd);
 
 	printf("Terminated by signal %d\n",signal);
 	exit(0);
 }
 
-int fdtable_lookup(int fd) {
-	for (int k = 0; k < MAXCLIENTS; k++)
-		if (fdtable[k].fd == fd)
-			return k;
-
-	return -1;
-}
-
-void remove_fd(int fd, int * num_active_clients) {
-	int idx = fdtable_lookup(fd);
-	if (idx >= 0) {
-		fdtable[*num_active_clients].fd = -1;
-		for (int j = idx; j < *num_active_clients; j++)
-			fdtable[j].fd = fdtable[j+1].fd;
-	}
+void epollupdate(int fd, uint32_t events, struct process_task * t) {
+	struct epoll_event event;
+	event.events = events;
+	event.data.ptr = t;
+	epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event); 
+	epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event); 
 }
 
 #ifdef HTTP_PROXY_ENABLED
@@ -195,9 +190,7 @@ void dnscallback(struct dns_cb_data * cbd) {
 	}
 
 	t->status = STATUS_PROXY_CON;
-	int idx = fdtable_lookup(t->fd);
-	fdtable[idx].fd = t->remotefd;
-	fdtable[idx].events = POLLOUT;
+	epollupdate(t->remotefd, POLLOUT, t);
 }
 
 int work_proxy(struct process_task * t) {
@@ -222,8 +215,7 @@ int work_proxy(struct process_task * t) {
 					t->request_size = 0;
 					t->offset = 0;
 
-					int idx = fdtable_lookup(t->remotefd);
-					fdtable[idx].events = POLLIN;
+					epollupdate(t->remotefd, POLLIN, t);
 				}
 			}
 			else if (errno != EAGAIN && errno != EWOULDBLOCK)
@@ -237,9 +229,8 @@ int work_proxy(struct process_task * t) {
 					t->offset = 0;
 					time(&t->start_time);
 
-					int idx = fdtable_lookup(t->remotefd);
-					fdtable[idx].fd = t->fd;
-					fdtable[idx].events = POLLOUT;
+					epollupdate(t->fd, POLLOUT, t);
+					epoll_ctl(epollfd, EPOLL_CTL_DEL, t->remotefd, NULL);
 				}
 				else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
 					return 1;
@@ -252,9 +243,8 @@ int work_proxy(struct process_task * t) {
 						time(&t->start_time);
 
 					if (t->request_size == t->offset) {
-						int idx = fdtable_lookup(t->fd);
-						fdtable[idx].fd = t->remotefd;
-						fdtable[idx].events = POLLIN;
+						epollupdate(t->remotefd, POLLIN, t);
+						epoll_ctl(epollfd, EPOLL_CTL_DEL, t->fd, NULL);
 					}
 				}
 				else if (errno != EAGAIN && errno != EWOULDBLOCK)
@@ -281,7 +271,7 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 		if (strstr((char*)t->request_data, "\r\n\r\n") != 0) {
 			// We got all the header, reponse now!
 			t->status = STATUS_RESP;
-			fdtable[fdtable_lookup(t->fd)].events = POLLOUT;
+			epollupdate(t->fd, POLLOUT, t);
 
 			// Parse the request header			
 			int userange = 1;
@@ -375,6 +365,7 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 					t->request_size = strlen((char*)t->request_data);
 					t->offset = 0;
 					dns_queue(dnsinstance, t, hostname, DNS_A_RECORD, dnscallback);
+					epoll_ctl(epollfd, EPOLL_CTL_DEL, t->fd, NULL);
 				};
 				} break;
 			#endif
@@ -387,14 +378,69 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 	return 0;
 }
 
+int work_response(struct process_task * t) {
+	if (t->offset == t->request_size) { // Try to feed more data into the buffers
+		// Fetch some data from the file
+		if (t->fdfile) {
+			int toread = WR_BLOCK_SIZE;
+			if (toread > (t->fend + 1 - ftello(t->fdfile))) toread = (t->fend + 1 - ftello(t->fdfile));
+			if (toread < 0) toread = 0; // File could change its size...
+
+			int numb = fread(tbuffer,1,toread,t->fdfile);
+			if (numb == 0 || toread == 0) {
+				// End of file, close the connection
+				return 1;
+			}
+			else if (numb > 0) {
+				// Try to write the data to the socket
+				int bwritten = write(t->fd,tbuffer,numb);
+
+				// Seek back if necessary
+				int bw = bwritten >= 0 ? bwritten : 0;
+				fseek(t->fdfile,-numb+bw,SEEK_CUR);
+
+				if (bwritten >= 0) {
+					time(&t->start_time);   // Update timeout
+				}
+				else if (errno != EAGAIN && errno != EWOULDBLOCK)
+					return 1;  // Some unknown error!
+			}
+			else
+				return 1;
+		} else if (t->dirlist) {
+			struct dirent *ep = readdir(t->dirlist);
+			if (ep) {
+				t->request_size = generate_dir_entry(t->request_data, ep);
+				t->offset = 0;
+			} else {
+				closedir(t->dirlist);
+				t->dirlist = 0;
+				return 1;
+			}
+		}
+		else
+			return 1;
+	}
+
+	if (t->offset < t->request_size) {  // Header
+		int bwritten = write(t->fd,&t->request_data[t->offset],t->request_size-t->offset);
+
+		if (bwritten >= 0) {
+			t->offset += bwritten;
+			time(&t->start_time);   // Update timeout
+		}
+		else if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return 1;  // Some unknown error!
+	}
+
+	return 0;
+}
 
 void server_run (int port, int ctimeout, char * base_path, int dirlist, int beproxy) {
 	signal (SIGTERM, process_exit);
 	signal (SIGHUP, process_exit);
 	signal (SIGINT, process_exit);
 	signal (SIGPIPE, SIG_IGN);
-
-	int num_active_clients = 0;
 
 	/* Force the network socket into nonblocking mode */
 	if (setNonblocking(listenfd) < 0)
@@ -405,42 +451,39 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 		EXIT_ERROR("Error listening on the port\n", 1);
 	}
 
-	for (int i = 0; i < MAXCLIENTS+1; i++) {
-		fdtable[i].fd = -1;
-		fdtable[i].events = POLLIN;  // By default
-		fdtable[i].revents = 0;
-	}
-	for (int i = 0; i < MAXCLIENTS; i++) {
-		tasks[i].fd = -1;
-		tasks[i].next = (i != MAXCLIENTS-1) ? &tasks[i+1] : 0;
-		tasks[i].id = i;
-	}
-	fdtable[0].fd = listenfd;
+	for (int i = 0; i < MAXCLIENTS; i++)
+		tasks[i].next = &tasks[i+1];
+	tasks[MAXCLIENTS-1].next = NULL;
+
+	epollfd = epoll_create(1);
+
+	#ifdef HTTP_PROXY_ENABLED
+	epollupdate(dns_get_fd(dnsinstance), POLLIN, NULL);
+	#endif
+	epollupdate(listenfd, POLLIN, NULL);
 
 	while (1) {
-		int num_sockets = num_active_clients + 1;
+		// Unblock if more than 1 second have elapsed (to allow killing dead connections)
+		struct epoll_event revents[MAXCLIENTS];
+		int nev = epoll_wait(epollfd, revents, MAXCLIENTS, 1000);
+
+		// DNS query
 		#ifdef HTTP_PROXY_ENABLED
 		dns_poll(dnsinstance);
-		fdtable[num_sockets].events = POLLIN;
-		fdtable[num_sockets].fd = dns_get_fd(dnsinstance);
-		num_sockets++;
 		#endif
 
-		// Unblock if more than 1 second have elapsed (to allow killing dead connections)
-		poll(fdtable, num_sockets, 1000);
+		// Accept loop
+		while (1) {
+			int fd = accept(listenfd, NULL, NULL);
+			if (fd < 0)
+				break;
 
-		int fd = accept(listenfd, NULL, NULL);
-		if (fd != -1) {
 			setNonblocking(fd);
 
 			if (free_task != 0) {
-				// Add the fd to the poll wait table!
-				assert(num_active_clients < MAXCLIENTS);
-				int i = ++num_active_clients;
-				fdtable[i].fd = fd;
-				fdtable[i].events = POLLIN;  // By default we read (the request)
-
 				struct process_task * t = free_task;
+
+				epollupdate(fd, POLLIN, t);
 				t->fd = fd;
 				t->request_size = 0;
 				t->status = STATUS_REQ;
@@ -451,18 +494,15 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 
 				// Remove from free list, add to proc list
 				free_task = free_task->next;
-				t->next = proc_task;
-				proc_task = t;
-			} else {
-				assert(num_active_clients == MAXCLIENTS);
+			} else
 				close(fd);
-			}
 		}
 
-		// Process the data
-		struct process_task * t = proc_task;
-		struct process_task * tp = NULL;
-		while (t != NULL) {
+		// Process the event queue
+		for (int e = 0; e < nev; e++) {
+			struct process_task * t = (struct process_task *)revents[e].data.ptr;
+			if (t == NULL) continue;
+
 			int force_end = 0;
 
 			// HTTP REQUEST READ
@@ -471,95 +511,20 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 
 			#ifdef HTTP_PROXY_ENABLED
 			if ((t->status == STATUS_PROXY || t->status == STATUS_PROXY_REQ ||
-			     t->status == STATUS_PROXY_FWD || t->status == STATUS_PROXY_CON) && !force_end)
+				 t->status == STATUS_PROXY_FWD || t->status == STATUS_PROXY_CON) && !force_end)
 				force_end |= work_proxy(t);
 			#endif
-			
+
 			// HTTP RESPONSE BODY WRITE
-			if (t->status == STATUS_RESP && !force_end) {
+			if (t->status == STATUS_RESP && !force_end)
+				force_end |= work_response(t);
 
-				if (t->offset == t->request_size) { // Try to feed more data into the buffers
-					// Fetch some data from the file
-					if (t->fdfile) {
-						int toread = WR_BLOCK_SIZE;
-						if (toread > (t->fend + 1 - ftello(t->fdfile))) toread = (t->fend + 1 - ftello(t->fdfile));
-						if (toread < 0) toread = 0; // File could change its size...
-
-						int numb = fread(tbuffer,1,toread,t->fdfile);
-						if (numb == 0 || toread == 0) {
-							// End of file, close the connection
-							force_end = 1;
-						}
-						else if (numb > 0) {
-							// Try to write the data to the socket
-							int bwritten = write(t->fd,tbuffer,numb);
-
-							// Seek back if necessary
-							int bw = bwritten >= 0 ? bwritten : 0;
-							fseek(t->fdfile,-numb+bw,SEEK_CUR);
-
-							if (bwritten >= 0) {
-								time(&t->start_time);   // Update timeout
-							}
-							else if (errno != EAGAIN && errno != EWOULDBLOCK)
-								force_end = 1;  // Some unknown error!
-						}
-						else
-							force_end = 1;
-					} else if (t->dirlist) {
-						struct dirent *ep = readdir(t->dirlist);
-						if (ep) {
-							t->request_size = generate_dir_entry(t->request_data, ep);
-							t->offset = 0;
-						} else {
-							closedir(t->dirlist);
-							t->dirlist = 0;
-							force_end = 1;
-						}
-					}
-					else
-						force_end = 1;
-				}
-
-				if (t->offset < t->request_size) {  // Header
-					int bwritten = write(t->fd,&t->request_data[t->offset],t->request_size-t->offset);
-
-					if (bwritten >= 0) {
-						t->offset += bwritten;
-						time(&t->start_time);   // Update timeout
-					}
-					else if (errno != EAGAIN && errno != EWOULDBLOCK)
-						force_end = 1;  // Some unknown error!
-				}
-			}
-
-			// Connection timeouts
-			long cur_time; time(&cur_time);
-			if (cur_time - t->start_time > ctimeout)
-				force_end = 1;
-
-			struct process_task * nextt = t->next;
-			if (force_end) { // Try to close the socket
-				// close connection and update the fdtable
-				remove_fd(t->fd, &num_active_clients);
-				remove_fd(t->remotefd, &num_active_clients);
+			// Close on error o timeout
+			if (time() - t->start_time > ctimeout || force_end) {
 				cleanup_task(t);
-				num_active_clients--;
-
-				// Remove from procesing list
-				// do not advance tp!
-				if (tp)
-					tp->next = t->next;
-				else
-					proc_task = t->next;
-
 				t->next = free_task;
 				free_task = t;
 			}
-			else // Regular list advance
-				tp = t;
-
-			t = nextt;
 		}
 	}
 }
@@ -637,5 +602,4 @@ int main (int argc, char ** argv) {
 	
 	server_run(port, timeout, base_path, dirlist, beproxy);
 }
-
 

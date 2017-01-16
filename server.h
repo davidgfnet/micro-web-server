@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <limits.h>
 #include <pwd.h>
+#include <dirent.h>
 
 #ifndef LLONG_MAX
 	#define LLONG_MAX 2094967295
@@ -38,13 +39,13 @@ void urldecode (char * dest, const char *url);
 // writes to param_str the value of the parameter in the request trimming whitespaces
 static char param_str[REQUEST_MAX_SIZE*3];
 int header_attr_lookup(const char * request, const char * param, const char * param_end) {
-	char * ptr = strstr(request,param);  // ptr to the parameter line
+	char * ptr = strcasestr(request, param);  // ptr to the parameter line
 	if (ptr == 0)
 		return -1;
 	ptr += strlen(param);  // ptr now points to the start of the data
 	while (*ptr == ' ') ptr++;  // trim whitespaces
 
-	char * ptr2 = strstr(ptr,param_end);   // ptr to the end of the line
+	char * ptr2 = strcasestr(ptr, param_end);   // ptr to the end of the line
 	if (ptr2 == 0)
 		return -1;
 

@@ -1,5 +1,6 @@
 
 #define _FILE_OFFSET_BITS 64
+#define _GNU_SOURCE
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -295,7 +296,7 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 				userange = 0;
 				t->fend = LLONG_MAX;
 			}else{
-				if (parse_range_req(param_str,&fstart,&t->fend) < 0) {
+				if (parse_range_req(param_str, &fstart, &t->fend) < 0) {
 					userange = 0;
 					fstart = 0;
 					t->fend = LLONG_MAX;

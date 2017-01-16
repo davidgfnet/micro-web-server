@@ -2,11 +2,11 @@
 all:	mhttpsrv mhttpsrvp
 
 mhttpsrv:
-	gcc -O2 -ggdb -o mhttpsrv server.c -Wall
+	gcc -std=gnu99 -O2 -ggdb -o mhttpsrv server.c -Wall
 	strip -s mhttpsrv
 
 mhttpsrvp:
-	gcc -O2 -ggdb -o mhttpsrvp server.c tadns.c -DHTTP_PROXY_ENABLED -Wall
+	gcc -std=gnu99 -O2 -ggdb -o mhttpsrvp server.c tadns.c -DHTTP_PROXY_ENABLED -Wall
 	strip -s mhttpsrvp
 
 clean:

@@ -182,6 +182,14 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 	if (temp[0] == '/')
 		strcpy_o(&temp[0],&temp[1]);
 
+	// Remove everything after the '?' since it's just arguments for the script (or cache busters!)
+	for (i = 0; i < (int)strlen(temp); i++) {
+		if (temp[i] == '?') {
+			temp[i] = 0;
+			break;
+		}
+	}
+
 	strcpy(out_file,base_path);
 	strcat(out_file,"/");
 	

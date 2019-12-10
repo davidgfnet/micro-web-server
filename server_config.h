@@ -20,11 +20,13 @@ struct mime_type {
 	{"css",		"text/css"},
 	{"gif",		"image/gif"},
 	{"png",		"image/png"},
+	{"js",		"application/javascript"},
 	{"jpg",		"image/jpeg"},
 	{"jpeg",	"image/jpeg"},
 	{"bmp",		"image/bmp"},
 	{"xml",		"text/xml"},
 	{"mp3",		"audio/mpeg"},
+	{"mod",		"video/mp4"},
 	{"avi",		"video/x-msvideo"}
 };
 

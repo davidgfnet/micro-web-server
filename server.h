@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <pwd.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 #ifndef LLONG_MAX
 	#define LLONG_MAX 2094967295
@@ -194,11 +195,11 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 	strcat(out_file,"/");
 	
 	urldecode(&out_file[strlen(out_file)], temp);
-	
-	// If it ends as "/" it's a path, so append default file
-	// (Only if it exists ofc)
-	unsigned osize = strlen(out_file);
-	if (out_file[strlen(out_file)-1] == '/') {
+
+	// Check whether we have a directory or a file
+	struct stat path_stat;
+	stat(out_file, &path_stat);
+	if (S_ISDIR(path_stat.st_mode)) {
 		strcat(out_file, DEFAULT_DOC);
 
 		// Try the index first
@@ -207,9 +208,6 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 			fclose(fd);
 			return RTYPE_FIL;
 		}
-
-		// Strip the default doc and output the dir
-		out_file[osize] = 0;
 	}
 
 	// Try to open the dir

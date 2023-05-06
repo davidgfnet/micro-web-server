@@ -14,20 +14,16 @@
 #include <time.h>
 #include <signal.h>
 #include <limits.h>
-#include <dirent.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <assert.h>
+#include <zip.h>
 
 #include "server_config.h"
 #include "server.h"
 
 #define STATUS_REQ         0               
 #define STATUS_RESP        1
-#define STATUS_PROXY       2
-#define STATUS_PROXY_CON   3
-#define STATUS_PROXY_REQ   4
-#define STATUS_PROXY_FWD   5
 
 const char ok_200[]  = "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 const char err_401[] = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Auth needed\"\r\n\r\nConnection: close\r\n\r\n";
@@ -35,25 +31,19 @@ const char err_403[] = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
 const char err_404[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
 const char err_405[] = "HTTP/1.1 405 Method not allowed\r\nConnection: close\r\n\r\n";
 const char err_413[] = "HTTP/1.1 413 Request Entity Too Large\r\nConnection: close\r\n\r\n";
-const char partial_206[]  = "HTTP/1.1 206 Partial content\r\nContent-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n";
 
-const char dirlist_200_txt[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
-const char dirlist_200_html[]  = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %u\r\nX-Directory: true\r\nConnection: close\r\n\r\n";
-
-char tbuffer[WR_BLOCK_SIZE];  // Temporary buffer for main thread usage
 char auth_str[128];           // eg. "Basic dXNlcjpwYXNz";
 
 struct process_task {
 	int fd;
-	FILE* fdfile;
+	zip_file_t* fdfile;
 	long start_time;
 	char status;
 	int offset;
-	long long fend;
 	unsigned short request_size;
 	unsigned char request_data[REQUEST_MAX_SIZE+1];
-	DIR *dirlist;
-	int remotefd, remoteport;
+	int tbufbytes;
+	char tbuffer[WR_BLOCK_SIZE];  // Temporary buffer for main thread usage
 
 	// List of free/nonfree tasks
 	struct process_task * next;
@@ -61,11 +51,6 @@ struct process_task {
 int listenfd, epollfd;
 struct process_task tasks[MAXCLIENTS];
 struct process_task * free_task = &tasks[0];
-
-#ifdef HTTP_PROXY_ENABLED
-#include "tadns.h"
-struct dns * dnsinstance;
-#endif
 
 #define EXIT_ERROR(msg, ecode) \
 	{ \
@@ -107,38 +92,17 @@ const char * mime_lookup(char * file) {
 	return mtypes[0].mime_type;  // Not found, defaulting
 }
 
-long long lof(FILE * fd) {
-	long long pos = ftello(fd);
-	fseeko(fd,0,SEEK_END);
-	long long len = ftello(fd);
-	fseeko(fd,pos,SEEK_SET);
-	return len;
-}
-
 void cleanup_task(struct process_task * t) {
 	epoll_ctl(epollfd, EPOLL_CTL_DEL, t->fd, NULL);
-	epoll_ctl(epollfd, EPOLL_CTL_DEL, t->remotefd, NULL);
 
-	if (t->dirlist) {
-		closedir(t->dirlist);
-		t->dirlist = 0;
-	}
 	if (t->fdfile) {
-		fclose(t->fdfile);
+		zip_fclose(t->fdfile);
 		t->fdfile = 0;
 	}
 	if (t->fd >= 0) {
 		close(t->fd);
 		t->fd = -1;
 	}
-	if (t->remotefd >= 0) {
-		close(t->remotefd);
-		t->remotefd = -1;
-	}
-	#ifdef HTTP_PROXY_ENABLED
-	// Try to cancel DNS req, even there is no inflight req
-	dns_cancel(dnsinstance, t);
-	#endif
 }
 
 void process_exit(int signal) {
@@ -165,97 +129,6 @@ void epollupdate(int fd, uint32_t events, struct process_task * t) {
 	epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event); 
 }
 
-#ifdef HTTP_PROXY_ENABLED
-void dnscallback(struct dns_cb_data * cbd) {
-	struct process_task * t = (struct process_task *)cbd->context;
-
-	if (cbd->error != DNS_OK) {
-		// Force timeout
-		t->start_time = 0;
-		return;
-	}
-
-	time(&t->start_time);
-
-	// Start connection
-	t->remotefd = socket(AF_INET, SOCK_STREAM, 0);
-	setNonblocking(listenfd);
-
-	struct sockaddr_in addr;
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(t->remoteport);
-	memcpy(&addr.sin_addr.s_addr, cbd->addr, 4);
-	int r = connect(t->remotefd, (const struct sockaddr*)&addr, sizeof(addr));
-	if (r < 0 && errno != EINPROGRESS) {
-		t->start_time = 0;
-		return;
-	}
-
-	t->status = STATUS_PROXY_CON;
-	epollupdate(t->remotefd, POLLOUT, t);
-}
-
-int work_proxy(struct process_task * t) {
-	if (t->remotefd >= 0) {
-		if (t->status == STATUS_PROXY_CON) {
-			int result;
-			socklen_t result_len = sizeof(result);
-			if (getsockopt(t->remotefd, SOL_SOCKET, SO_ERROR, &result, &result_len) < 0)
-				return 1;
-			t->status = STATUS_PROXY_REQ;
-		}
-		if (t->status == STATUS_PROXY_REQ) {
-			// Keep sending request to the remote host
-			int w = write(t->remotefd, &t->request_data[t->offset], t->request_size - t->offset);
-			if (w >= 0) {
-				t->offset += w;
-				if (w > 0)
-					time(&t->start_time);
-
-				if (t->offset == t->request_size) {
-					t->status = STATUS_PROXY_FWD;
-					epollupdate(t->remotefd, POLLIN, t);
-				}
-			}
-			else if (errno != EAGAIN && errno != EWOULDBLOCK)
-				return 1;
-		}
-		if (t->status == STATUS_PROXY_FWD) {
-			if (t->request_size == t->offset) {
-				int r = read(t->remotefd, t->request_data, REQUEST_MAX_SIZE);
-				if (r > 0) {
-					t->request_size = r;
-					t->offset = 0;
-					time(&t->start_time);
-
-					epollupdate(t->fd, POLLOUT, t);
-					epoll_ctl(epollfd, EPOLL_CTL_DEL, t->remotefd, NULL);
-				}
-				else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
-					return 1;
-			}
-			if (t->request_size != t->offset) {
-				int w = write(t->fd, &t->request_data[t->offset], t->request_size - t->offset);
-				if (w >= 0) {
-					t->offset += w;
-					if (w > 0)
-						time(&t->start_time);
-
-					if (t->request_size == t->offset) {
-						epollupdate(t->remotefd, POLLIN, t);
-						epoll_ctl(epollfd, EPOLL_CTL_DEL, t->fd, NULL);
-					}
-				}
-				else if (errno != EAGAIN && errno != EWOULDBLOCK)
-					return 1;
-			}
-		}
-	}
-
-	return 0;
-}
-#endif
-
 int check_auth(struct process_task *t) {
 	// Auth
 	if (auth_str[0] != 0) {
@@ -268,7 +141,7 @@ int check_auth(struct process_task *t) {
 	return 1;
 }
 
-int work_request(struct process_task * t, const char * base_path, int dirlist, int beproxy) {
+int work_request(struct process_task * t, zip_t * zipf) {
 	// We don't support long requests due to small buffers
 	if (t->request_size >= REQUEST_MAX_SIZE) {
 		t->status = STATUS_RESP;
@@ -289,20 +162,6 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 			t->status = STATUS_RESP;
 			epollupdate(t->fd, POLLOUT, t);
 
-			// Parse the request header			
-			int userange = 1;
-			long long fstart = 0;
-			if (header_attr_lookup((char*)t->request_data, "Range:", "\r\n") < 0) {
-				userange = 0;
-				t->fend = LLONG_MAX;
-			}else{
-				if (parse_range_req(param_str, &fstart, &t->fend) < 0) {
-					userange = 0;
-					fstart = 0;
-					t->fend = LLONG_MAX;
-				}
-			}
-
 			if (!check_auth(t))
 				RETURN_STRBUF(t, err_401);
 
@@ -310,64 +169,36 @@ int work_request(struct process_task * t, const char * base_path, int dirlist, i
 			int isget = header_attr_lookup((char*)t->request_data, "GET ", " ") >= 0; // Get the file
 			if (!isget)
 				ishead = header_attr_lookup((char*)t->request_data, "HEAD ", " ") >= 0; // Get the file
+
 			char file_path[MAX_PATH_LEN*2];
-			int code = beproxy ? RTYPE_PROXY : path_create(base_path, param_str, file_path);
+			path_create(param_str, file_path);
+
+			struct zip_stat zst;
+			int code = RTYPE_404;
+			if (zip_stat(zipf, file_path, ZIP_FL_ENC_UTF_8, &zst) >= 0)
+				code = RTYPE_FIL;
+
 			if (!isget && !ishead) code = RTYPE_405;
-			if (code == RTYPE_DIR && !dirlist) code = RTYPE_403;
 
 			switch (code) {
 			case RTYPE_403: RETURN_STRBUF(t, err_403);
 			case RTYPE_404: RETURN_STRBUF(t, err_404);
 			case RTYPE_405: RETURN_STRBUF(t, err_405);
-			case RTYPE_DIR:  // Dir
-				if (!ishead)
-					t->dirlist = opendir(file_path);
-				#ifdef HTMLLIST
-					sprintf((char*)t->request_data, dirlist_200_html, dirlist_size(file_path));
-				#else
-					sprintf((char*)t->request_data, dirlist_200_txt, dirlist_size(file_path));
-				#endif
-				t->request_size = strlen((char*)t->request_data);
-				break;
 			case RTYPE_FIL:{// File
-				FILE * fd = fopen(file_path,"rb");
-				long long len = lof(fd);
+				zip_file_t *fd = zip_fopen(zipf, file_path, 0);
 				const char * mimetype = mime_lookup(file_path);
-				if (t->fend > len-1) t->fend = len-1;  // Last byte, not size
-				long long content_length = t->fend - fstart + 1;
+				long long content_length = zst.size;
 
-				if (userange && isget) {
-					sprintf((char*)t->request_data, partial_206, fstart, t->fend, len,content_length, mimetype);
-					t->request_size = strlen((char*)t->request_data);
-				}else{
-					sprintf((char*)t->request_data, ok_200, content_length, mimetype);
-					t->request_size = strlen((char*)t->request_data);
-				}
+				sprintf((char*)t->request_data, ok_200, content_length, mimetype);
+				t->request_size = strlen((char*)t->request_data);
 
 				if (ishead) {
-					fclose(fd);
+					zip_fclose(fd);
 				} else {
 					t->fdfile = fd;
-					fseeko(fd, fstart, SEEK_SET); // Seek the first byte
 				}
 				}break;
 
-			#ifdef HTTP_PROXY_ENABLED
-			case RTYPE_PROXY:{
-				t->status = STATUS_PROXY;
-
-				urldecode(file_path, param_str);
-				const char *hostname, *path;
-				if (parse_url(file_path, &hostname, &t->remoteport, &path)) {
-					// Prepare request
-					sprintf((char*)t->request_data, "GET /%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, hostname);
-					t->request_size = strlen((char*)t->request_data);
-					t->offset = 0;
-					dns_queue(dnsinstance, t, hostname, DNS_A_RECORD, dnscallback);
-					epoll_ctl(epollfd, EPOLL_CTL_DEL, t->fd, NULL);
-				};
-				} break;
-			#endif
 			};
 		}
 	}
@@ -381,37 +212,29 @@ int work_response(struct process_task * t) {
 	if (t->offset == t->request_size) { // Try to feed more data into the buffers
 		// Fetch some data from the file
 		if (t->fdfile) {
-			int toread = WR_BLOCK_SIZE;
-			if (toread > (t->fend + 1 - ftello(t->fdfile))) toread = (t->fend + 1 - ftello(t->fdfile));
-			if (toread < 0) toread = 0; // File could change its size...
+			int toread = WR_BLOCK_SIZE - t->tbufbytes;
+			if (toread) {
+				int numb = zip_fread(t->fdfile, &t->tbuffer[t->tbufbytes], toread);
+				if (numb < 0)
+					return 1;
+				t->tbufbytes += numb;
+			}
 
-			int numb = fread(tbuffer,1,toread,t->fdfile);
-			if (numb > 0) {
+			if (t->tbufbytes > 0) {
 				// Try to write the data to the socket
-				int bwritten = write(t->fd,tbuffer,numb);
-
-				// Seek back if necessary
-				int bw = bwritten >= 0 ? bwritten : 0;
-				fseek(t->fdfile,-numb+bw,SEEK_CUR);
+				int bwritten = write(t->fd, t->tbuffer, t->tbufbytes);
 
 				if (bwritten >= 0) {
 					time(&t->start_time);   // Update timeout
+					// Remove bytes from buffer
+					memmove(&t->tbuffer[0], &t->tbuffer[bwritten], t->tbufbytes - bwritten);
+					t->tbufbytes -= bwritten;
 				}
 				else if (errno != EAGAIN && errno != EWOULDBLOCK)
 					return 1;  // Some unknown error!
 			}
-			else  // Error or end of file
+			else  // End of file
 				return 1;
-		} else if (t->dirlist) {
-			struct dirent *ep = readdir(t->dirlist);
-			if (ep) {
-				t->request_size = generate_dir_entry(t->request_data, ep);
-				t->offset = 0;
-			} else {
-				closedir(t->dirlist);
-				t->dirlist = 0;
-				return 1;
-			}
 		}
 		else
 			return 1;
@@ -430,7 +253,7 @@ int work_response(struct process_task * t) {
 	return 0;
 }
 
-void server_run (int port, int ctimeout, char * base_path, int dirlist, int beproxy) {
+void server_run (int port, int ctimeout, zip_t * zipf) {
 	signal (SIGTERM, process_exit);
 	signal (SIGHUP, process_exit);
 	signal (SIGINT, process_exit);
@@ -451,20 +274,12 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 
 	epollfd = epoll_create(1);
 
-	#ifdef HTTP_PROXY_ENABLED
-	epollupdate(dns_get_fd(dnsinstance), POLLIN, NULL);
-	#endif
 	epollupdate(listenfd, POLLIN, NULL);
 
 	while (1) {
 		// Unblock if more than 1 second have elapsed (to allow killing dead connections)
 		struct epoll_event revents[MAXCLIENTS];
 		int nev = epoll_wait(epollfd, revents, MAXCLIENTS, 1000);
-
-		// DNS query
-		#ifdef HTTP_PROXY_ENABLED
-		dns_poll(dnsinstance);
-		#endif
 
 		// Accept loop
 		while (1) {
@@ -482,8 +297,8 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 				t->request_size = 0;
 				t->status = STATUS_REQ;
 				t->fdfile = 0;
-				t->dirlist = 0;
 				t->offset = 0;
+				t->tbufbytes = 0;
 				time(&t->start_time);
 
 				// Remove from free list, add to proc list
@@ -501,13 +316,7 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 
 			// HTTP REQUEST READ
 			if (t->status == STATUS_REQ)
-				force_end |= work_request(t, base_path, dirlist, beproxy);
-
-			#ifdef HTTP_PROXY_ENABLED
-			if ((t->status == STATUS_PROXY || t->status == STATUS_PROXY_REQ ||
-				 t->status == STATUS_PROXY_FWD || t->status == STATUS_PROXY_CON) && !force_end)
-				force_end |= work_proxy(t);
-			#endif
+				force_end |= work_request(t, zipf);
 
 			// HTTP RESPONSE BODY WRITE
 			if (t->status == STATUS_RESP && !force_end)
@@ -524,9 +333,8 @@ void server_run (int port, int ctimeout, char * base_path, int dirlist, int bepr
 }
 
 int main (int argc, char ** argv) {
-	int port = 8080, timeout = 8, dirlist = 0, beproxy = 0;
-	char base_path[MAX_PATH_LEN] = {0};
-	getcwd(base_path, MAX_PATH_LEN-1);
+	int port = 8080, timeout = 8;
+	char zip_path[MAX_PATH_LEN] = {0};
 	char sw_user[256] = "nobody";
 
 	int i;
@@ -537,40 +345,35 @@ int main (int argc, char ** argv) {
 		// Timeout
 		if (strcmp(argv[i],"-t") == 0)
 			sscanf(argv[++i], "%d", &timeout);
-		// Base dir
-		if (strcmp(argv[i],"-d") == 0)
-			strcpy(base_path, argv[++i]);
-		// Dir list
-		if (strcmp(argv[i],"-l") == 0)
-			dirlist = 1;
+		// Zip file to serve
+		if (strcmp(argv[i],"-z") == 0)
+			strcpy(zip_path, argv[++i]);
 		// User drop
 		if (strcmp(argv[i],"-u") == 0)
 			strcpy(sw_user, argv[++i]);
 		// Auth
 		if (strcmp(argv[i],"-a") == 0)
 			strcpy(auth_str, argv[++i]);
-		// URL proxy
-		#ifdef HTTP_PROXY_ENABLED
-		if (strcmp(argv[i],"-x") == 0)
-			beproxy = 1;
-		#endif
 		// Help
 		if (strcmp(argv[i],"-h") == 0) {
-			printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
+			printf("Usage: server [-p port] [-t timeout] [-z zip_file] [-u user]\n"
 			"    -p     Port             (Default port is 8080)\n"
 			"    -t     Timeout          (Default timeout is 8 seconds of network inactivity)\n"
-			"    -d     Base Dir         (Default dir is working dir)\n"
-			"    -l     Enable dir lists (Off by default for security reasons)\n"
+			"    -z     Zip file         (Zip file to serve)\n"
 			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody))\n"
 			"    -a     HTTP Auth        (Specify an auth string, i.e. \"Basic dXNlcjpwYXNz\")\n"
-			#ifdef HTTP_PROXY_ENABLED
-			"    -x     URL proxy        (This disables the file serving)\n"
-			#endif
 			);
 			exit(0);
 		}
 	}
-	
+
+	// Open zip file
+	zip_t * zipf = zip_open(zip_path, ZIP_RDONLY, NULL);
+	if (!zipf) {
+		fprintf(stderr,"Could not open zip file '%s'\n", zip_path);
+		exit(1);
+	}
+
 	// Bind port!
 	struct sockaddr_in servaddr;
 
@@ -593,11 +396,7 @@ int main (int argc, char ** argv) {
 	}
 	setgid(pw->pw_gid);
 	setuid(pw->pw_uid);
-
-	#ifdef HTTP_PROXY_ENABLED
-	dnsinstance = dns_init();
-	#endif
 	
-	server_run(port, timeout, base_path, dirlist, beproxy);
+	server_run(port, timeout, zipf);
 }
 

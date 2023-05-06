@@ -3,8 +3,8 @@
 #define REQUEST_MAX_SIZE   2047          // Maximum allowed size for a GET request
 #define MAX_PATH_LEN	   4096          // Maximum size (in chars) for a path in the filesystem
 
-#define MAXCLIENTS       128             // Maximum number of simultaneous connections allowed (the bigger, the more mem used)
-#define WR_BLOCK_SIZE	 (1024*1024)     // Chunk size for disk read/write operations, the bigger the more throughput
+#define MAXCLIENTS       64              // Maximum number of simultaneous connections allowed (the bigger, the more mem used)
+#define WR_BLOCK_SIZE	 (32*1024)     // Chunk size for disk read/write operations, the bigger the more throughput
 
 #define HTMLLIST                         // Directory listing is an HTML doc (as opposted to TXT)
 

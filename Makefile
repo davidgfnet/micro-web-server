@@ -2,15 +2,11 @@
 all:	mhttpsrv mhttpsrvp
 
 mhttpsrv:
-	gcc -std=gnu99 -O2 -ggdb -o mhttpsrv server.c -Wall
+	gcc -std=gnu99 -O2 -ggdb -o mhttpsrv server.c -Wall -lzip
 	strip -s mhttpsrv
 
-mhttpsrvp:
-	gcc -std=gnu99 -O2 -ggdb -o mhttpsrvp server.c tadns.c -DHTTP_PROXY_ENABLED -Wall
-	strip -s mhttpsrvp
-
 clean:
-	rm -f mhttpsrv mhttpsrvp regression
+	rm -f mhttpsrv regression
 
 .PHONY:	regression
 regression:

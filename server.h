@@ -142,7 +142,7 @@ void strcpy_o(char * dest, char * src) {
 	*dest = 0;
 }
 
-int path_create(const char * base_path, const char * req_file, char * out_file) {
+void path_create(const char * req_file, char * out_file) {
 	char temp[ strlen(req_file)+1 ];
 	strcpy(temp, req_file);
 	
@@ -191,40 +191,8 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 		}
 	}
 
-	strcpy(out_file,base_path);
-	strcat(out_file,"/");
-	
-	urldecode(&out_file[strlen(out_file)], temp);
-
-	// Check whether we have a directory or a file
-	struct stat path_stat;
-	stat(out_file, &path_stat);
-	if (S_ISDIR(path_stat.st_mode)) {
-		strcat(out_file, DEFAULT_DOC);
-
-		// Try the index first
-		FILE * fd = fopen(out_file, "rb");
-		if (fd) {
-			fclose(fd);
-			return RTYPE_FIL;
-		}
-	}
-
-	// Try to open the dir
-	void * ptr = opendir(out_file);
-	if (ptr) {
-		closedir(ptr);
-		return RTYPE_DIR;
-	}
-
-	// Try as file
-	FILE * fd = fopen(out_file, "rb");
-	if (fd) {
-		fclose(fd);
-		return RTYPE_FIL;
-	}
-
-	return RTYPE_404;
+	out_file[0] = 0;
+	urldecode(out_file, temp);
 }
 
 char hex2char(const char * i) {

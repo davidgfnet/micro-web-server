@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -530,25 +531,62 @@ int main (int argc, char ** argv) {
 	char sw_user[256] = "nobody";
 
 	int i;
+	int help = 0;
 	for (i = 1; i < argc; i++) {
 		// Port
-		if (strcmp(argv[i],"-p") == 0)
-			sscanf(argv[++i], "%d", &port);
+		if (strcmp(argv[i],"-p") == 0) {
+			if (++i >= argc || sscanf(argv[i], "%d", &port) != 1) {
+				help = 1;
+				break;
+			}
+		}
 		// Timeout
-		if (strcmp(argv[i],"-t") == 0)
-			sscanf(argv[++i], "%d", &timeout);
+		if (strcmp(argv[i],"-t") == 0) {
+			if (++i >= argc || sscanf(argv[i], "%d", &timeout) != 1) {
+				help = 1;
+				break;
+			}
+		}
 		// Base dir
-		if (strcmp(argv[i],"-d") == 0)
-			strcpy(base_path, argv[++i]);
-		// Dir list
-		if (strcmp(argv[i],"-l") == 0)
-			dirlist = 1;
+		if (strcmp(argv[i],"-d") == 0) {
+			if (++i >= argc) {
+				help = 1;
+				break;
+			}
+			int x;
+			for (x = 0; argv[i][x]; x++) {
+				base_path[x] = argv[i][x];
+			}
+			base_path[x] = 0;
+			while (--x >= 0 && (base_path[x] == ' ' || base_path[x] == '\t' || 
+								base_path[x] == '\r' || base_path[x] == '\n')) {
+				base_path[x] = 0;
+			}
+			x++;
+			while (--x >= 0 && base_path[x] == '/') {
+				base_path[x] = 0;
+			}
+		}
 		// User drop
-		if (strcmp(argv[i],"-u") == 0)
-			strcpy(sw_user, argv[++i]);
+		if (strcmp(argv[i],"-u") == 0) {
+			if (++i >= argc) {
+				help = 1;
+				break;
+			}
+			strcpy(sw_user, argv[i]);
+		}
 		// Auth
-		if (strcmp(argv[i],"-a") == 0)
-			strcpy(auth_str, argv[++i]);
+		if (strcmp(argv[i],"-a") == 0) {
+			if (++i >= argc) {
+				help = 1;
+				break;
+			}
+			strcpy(auth_str, argv[i]);
+		}
+		// Dir list
+		if (strcmp(argv[i],"-l") == 0) {
+			dirlist = 1;
+		}
 		// URL proxy
 		#ifdef HTTP_PROXY_ENABLED
 		if (strcmp(argv[i],"-x") == 0)
@@ -556,21 +594,25 @@ int main (int argc, char ** argv) {
 		#endif
 		// Help
 		if (strcmp(argv[i],"-h") == 0) {
-			printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
-			"    -p     Port             (Default port is 8080)\n"
-			"    -t     Timeout          (Default timeout is 8 seconds of network inactivity)\n"
-			"    -d     Base Dir         (Default dir is working dir)\n"
-			"    -l     Enable dir lists (Off by default for security reasons)\n"
-			"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody))\n"
-			"    -a     HTTP Auth        (Specify an auth string, i.e. \"Basic dXNlcjpwYXNz\")\n"
-			#ifdef HTTP_PROXY_ENABLED
-			"    -x     URL proxy        (This disables the file serving)\n"
-			#endif
-			);
-			exit(0);
+			help = 1;
+			break;
 		}
 	}
-	
+	if (help) {
+		printf("Usage: server [-p port] [-t timeout] [-d base_dir] [-u user]\n"
+		"    -p     Port             (Default port is 8080)\n"
+		"    -t     Timeout          (Default timeout is 8 seconds of network inactivity)\n"
+		"    -d     Base Dir         (Default dir is working dir)\n"
+		"    -l     Enable dir lists (Off by default for security reasons)\n"
+		"    -u     Switch to user   (Switch to specified user (may drop privileges, by default nobody))\n"
+		"    -a     HTTP Auth        (Specify an auth string, i.e. \"Basic dXNlcjpwYXNz\")\n"
+		#ifdef HTTP_PROXY_ENABLED
+		"    -x     URL proxy        (This disables the file serving)\n"
+		#endif
+		);
+		exit(0);
+	}
+
 	// Bind port!
 	struct sockaddr_in servaddr;
 
@@ -597,7 +639,6 @@ int main (int argc, char ** argv) {
 	#ifdef HTTP_PROXY_ENABLED
 	dnsinstance = dns_init();
 	#endif
-	
+
 	server_run(port, timeout, base_path, dirlist, beproxy);
 }
-

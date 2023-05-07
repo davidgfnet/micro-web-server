@@ -28,7 +28,7 @@
 #define RTYPE_403    4
 #define RTYPE_PROXY  5
 
-void urldecode (char * dest, const char *url);
+int urldecode (char * dest, const char *url);
 
 #define RETURN_STRBUF(task, buffer) \
 	{ \
@@ -89,17 +89,17 @@ int parse_range_req(const char * req_val, long long * start, long long * end) {
 	// bytes=120-123 (interval)
 	// bytes=1-2,5-6 (multiple chunks)
 	// We only support %- or %-%
-	
+
 	// By default whole file
 	*start = 0;
 	*end = LLONG_MAX;
 
 	// Check if there's a comma!
-	if (strstr(req_val,",") != 0)
+	if (strchr(req_val, ',') != 0)
 		return -1;
 
 	// Strip bytes prefix
-	const char * ptr = strstr(req_val,"=");
+	const char * ptr = strchr(req_val, '=');
 	if (ptr == 0) ptr = req_val;
 	else ptr++; //Skip "="
 
@@ -111,9 +111,9 @@ int parse_range_req(const char * req_val, long long * start, long long * end) {
 	// Read the start
 	sscanf(ptr,"%lld %*s",start);
 	if (*start < 0) return -1;
-	
+
 	// Search for "-" 
-	ptr = strstr(ptr,"-");
+	ptr = strchr(ptr, '-');
 	if (ptr == 0)
 		return 0;  // No "-" present, assuming EOF
 	else
@@ -127,7 +127,7 @@ int parse_range_req(const char * req_val, long long * start, long long * end) {
 
 	// Read the end
 	sscanf(ptr,"%lld %*s",end);
-	
+
 	// Both should be positive values, being start >= end
 	if (*end < 0 || *start > *end) return -1;
 
@@ -145,7 +145,7 @@ void strcpy_o(char * dest, char * src) {
 int path_create(const char * base_path, const char * req_file, char * out_file) {
 	char temp[ strlen(req_file)+1 ];
 	strcpy(temp, req_file);
-	
+
 	int i,j;
 	// Remove double slashes
 	for (i = 0; i < (int)strlen(temp)-1; i++) {
@@ -158,7 +158,7 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 	for (i = 0; i < (int)strlen(temp)-4; i++) {
 		if (temp[i] == '/' && temp[i+1] == '.' && 
 			temp[i+2] == '.' && temp[i+3] == '/') {
-			
+
 			// Remove previous folder
 			for (j = i-1; j >= 0; j--) {
 				if (temp[j] == '/' || j == 0) {
@@ -173,13 +173,13 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 	for (i = 0; i < (int)strlen(temp)-4; i++) {
 		if (temp[i] == '/' && temp[i+1] == '.' && 
 			temp[i+2] == '.' && temp[i+3] == '/') {
-			
+
 			// Remove previous folder
 			strcpy_o(&temp[i],&temp[i+3]);
 			i--;
 		}
 	}
-	
+
 	if (temp[0] == '/')
 		strcpy_o(&temp[0],&temp[1]);
 
@@ -191,16 +191,19 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 		}
 	}
 
-	strcpy(out_file,base_path);
-	strcat(out_file,"/");
-	
-	urldecode(&out_file[strlen(out_file)], temp);
+	char* p = out_file;
+	for (i = 0; base_path[i]; i++) {
+		*p++ = base_path[i];
+	}
+	*p++ = '/';
+	*p = 0;
+	p += urldecode(p, temp);
 
 	// Check whether we have a directory or a file
 	struct stat path_stat;
 	stat(out_file, &path_stat);
 	if (S_ISDIR(path_stat.st_mode)) {
-		strcat(out_file, DEFAULT_DOC);
+		strcpy(p, DEFAULT_DOC);
 
 		// Try the index first
 		FILE * fd = fopen(out_file, "rb");
@@ -208,6 +211,7 @@ int path_create(const char * base_path, const char * req_file, char * out_file) 
 			fclose(fd);
 			return RTYPE_FIL;
 		}
+		*p = 0;
 	}
 
 	// Try to open the dir
@@ -232,11 +236,11 @@ char hex2char(const char * i) {
 	if      (i[0] >= '0' && i[0] <= '9') c1 = i[0]-'0';
 	else if (i[0] >= 'a' && i[0] <= 'f') c1 = i[0]-'a'+10;
 	else                                 c1 = i[0]-'A'+10;
-		
+
 	if      (i[1] >= '0' && i[1] <= '9') c2 = i[1]-'0';
 	else if (i[1] >= 'a' && i[1] <= 'f') c2 = i[1]-'a'+10;
 	else                                 c2 = i[1]-'A'+10;
-	
+
 	return c1*16+c2;
 }
 int ishexpair(const char * i) {
@@ -273,7 +277,7 @@ int parse_url(char * in, const char **hostname, int * port, const char ** path) 
 	return 1;
 }
 
-void urldecode (char * dest, const char *url) {
+int urldecode (char * dest, const char *url) {
 	int s = 0, d = 0;
 	int url_len = strlen (url) + 1;
 
@@ -297,6 +301,5 @@ void urldecode (char * dest, const char *url) {
 			dest[d++] = c;
 		}
 	}
+	return d-1;
 }
-
-

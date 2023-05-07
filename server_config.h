@@ -1,5 +1,5 @@
 
-#define DEFAULT_DOC	   "/index.html"  // Default doc to serve when URL points to dir
+#define DEFAULT_DOC	   "index.html"  // Default doc to serve when URL points to dir
 #define REQUEST_MAX_SIZE   2047          // Maximum allowed size for a GET request
 #define MAX_PATH_LEN	   4096          // Maximum size (in chars) for a path in the filesystem
 
